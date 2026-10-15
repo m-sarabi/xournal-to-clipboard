@@ -130,6 +130,47 @@ class TestCopyPageToClipboard(unittest.TestCase):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    def test_clipboard_powershell_windows_apostrophe_path(self):
+        """Verify Windows PowerShell clipboard command succeeds with apostrophe in filename."""
+        if sys.platform != "win32":
+            self.skipTest("Windows-only clipboard test")
+
+        import tempfile
+        from PIL import Image
+
+        temp_dir = tempfile.gettempdir()
+        tmp_path = os.path.join(temp_dir, "test_O'Connor_note.png")
+
+        try:
+            img = Image.new("RGB", (32, 32), color=(0, 128, 255))
+            img.save(tmp_path)
+
+            norm_path = tmp_path.replace("\\", "/")
+            escaped_path = norm_path.replace("'", "''")
+            ps_cmd = (
+                f'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "'
+                f'Add-Type -AssemblyName System.Windows.Forms; '
+                f'Add-Type -AssemblyName System.Drawing; '
+                f'$img = [System.Drawing.Image]::FromFile(\'{escaped_path}\'); '
+                f'[System.Windows.Forms.Clipboard]::SetImage($img); '
+                f'$img.Dispose();"'
+            )
+
+            res = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"PowerShell command failed with apostrophe in path:\n{res.stderr}")
+
+            verify_script = (
+                "powershell.exe -Sta -NoProfile -NonInteractive -Command \""
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$c = [System.Windows.Forms.Clipboard]::GetImage(); "
+                "if ($c -ne $null) { Write-Output ($c.Width.ToString() + 'x' + $c.Height.ToString()) } else { Write-Output 'NONE' }\""
+            )
+            verify_res = subprocess.check_output(verify_script, shell=True, text=True).strip()
+            self.assertEqual(verify_res, "32x32", f"Clipboard did not contain expected 32x32 image, got: {verify_res}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
 
 if __name__ == "__main__":
     unittest.main()

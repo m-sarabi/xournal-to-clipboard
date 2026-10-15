@@ -106,6 +106,8 @@ print("  PASSED: Configuration persistence correctly reads, writes, and validate
 -- 3. Quality Mode Actions and Cycling
 --------------------------------------------------------------------------------
 print("\n[Test 3] Verifying quality presets and cycling...")
+local cycleConfigPath = tempDir .. sep .. "test_copypage_cycle_" .. tostring(os.time()) .. ".ini"
+plugin.customConfigPath = cycleConfigPath
 plugin.config.mode = "dpi"
 plugin.config.dpi = 300
 plugin.config.width = 1920
@@ -134,7 +136,15 @@ plugin.cycleWidth()
 assert_eq(plugin.config.width, 3840, "2560 px should cycle to 3840 px")
 plugin.cycleWidth()
 assert_eq(plugin.config.width, 1280, "3840 px should cycle back to 1280 px")
-print("  PASSED: Mode toggling and preset cycling function correctly.")
+
+-- Reset configuration to clean default state and clean up temp file
+plugin.config.mode = "dpi"
+plugin.config.dpi = 300
+plugin.config.width = 1920
+plugin.saveConfig(cycleConfigPath, plugin.config)
+os.remove(cycleConfigPath)
+plugin.customConfigPath = nil
+print("  PASSED: Mode toggling and preset cycling function correctly without polluting environment.")
 
 --------------------------------------------------------------------------------
 -- 4. Operating System Detection & Command Formation
@@ -158,6 +168,17 @@ assert_true(winCmd:find("System%.Drawing"), "Windows command must load System.Dr
 assert_true(winCmd:find("Clipboard%]:%:SetImage"), "Windows command must call SetImage")
 assert_true(winCmd:find("Dispose%(%)"), "Windows command must dispose image to release file lock")
 assert_true(not winCmd:find("\\"), "Windows command should normalize backslashes to forward slashes")
+assert_true(winCmd:find("-ExecutionPolicy Bypass"), "Windows command should use -ExecutionPolicy Bypass")
+
+-- Test Windows Command with embedded single quotes (e.g. John O'Connor)
+local winCmdQuotes = plugin.getWindowsClipboardCommand("C:\\Users\\John O'Connor\\AppData\\Local\\Temp\\page.png")
+assert_true(winCmdQuotes:find("O''Connor"), "Windows command must escape single quotes as double single-quotes")
+
+-- Test shellEscape helper directly
+local escaped = plugin.shellEscape("/tmp/path with 'quotes' and $VAR and `cmd`.png")
+assert_true(escaped:sub(1, 1) == "'", "shellEscape must start with single quote")
+assert_true(escaped:sub(-1) == "'", "shellEscape must end with single quote")
+assert_true(escaped:find("'\\''quotes'\\''") ~= nil, "shellEscape must safely escape embedded single quotes")
 
 -- Test Linux Wayland Command
 local waylandCmd = plugin.getLinuxWaylandCommand("/tmp/page.png")
@@ -181,7 +202,11 @@ local macCmd = plugin.getMacClipboardCommand("/tmp/page.png")
 assert_true(macCmd:find("osascript"), "macOS command must invoke osascript")
 assert_true(macCmd:find("«class PNGf»"), "macOS command must cast to «class PNGf»")
 assert_true(macCmd:find("POSIX file"), "macOS command must use POSIX file handler")
-print("  PASSED: Cross-platform clipboard commands correctly formed for Windows, Linux, and macOS.")
+
+-- Test macOS Command escaping
+local macEscaped = plugin.getMacClipboardCommand("/tmp/test 'image' \"quoted\".png")
+assert_true(macEscaped:find("\\\"quoted\\\"") ~= nil, "macOS command must escape double quotes for AppleScript")
+print("  PASSED: Cross-platform clipboard commands correctly formed and escaped for Windows, Linux, and macOS.")
 
 --------------------------------------------------------------------------------
 -- 5. Temporary File Management & Path Resolution
@@ -214,6 +239,24 @@ os.remove(dummyPaged)
 local fC = io.open(dummySingle, "wb") fC:write("dummy") fC:close()
 assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 2), dummySingle, "Should find single-page -1.png match")
 os.remove(dummySingle)
+
+-- Case D: Underscore suffix file exists (e.g. _3.png for page 3)
+local dummyUnderscore = dummyBase .. "_3.png"
+local fD = io.open(dummyUnderscore, "wb") fD:write("dummy") fD:close()
+assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 3), dummyUnderscore, "Should find underscore-suffixed _3.png match")
+os.remove(dummyUnderscore)
+
+-- Case E: Zero-padded underscore file exists (e.g. _01.png)
+local dummyPadded_ = dummyBase .. "_01.png"
+local fE = io.open(dummyPadded_, "wb") fE:write("dummy") fE:close()
+assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 1), dummyPadded_, "Should find zero-padded underscore match")
+os.remove(dummyPadded_)
+
+-- Case F: Page-prefixed suffix exists (e.g. _page3.png)
+local dummyPagePrefixed = dummyBase .. "_page3.png"
+local fF = io.open(dummyPagePrefixed, "wb") fF:write("dummy") fF:close()
+assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 3), dummyPagePrefixed, "Should find page-prefixed match")
+os.remove(dummyPagePrefixed)
 
 -- Test cleanupFiles safely removes list of files
 local cleanFile1 = tempDir .. sep .. "clean_test_1.tmp"
@@ -280,7 +323,64 @@ assert_true(hasCtrlAltC, "<Control><Alt>c accelerator shortcut must be bound")
 -- Verify active page index resolution
 local resolvedPage, docStruct = plugin.getActivePageIndex()
 assert_eq(resolvedPage, 2, "Active page index should match mock document currentPage (2)")
-print("  PASSED: UI registration and accelerator shortcut successfully verified.")
+
+-- Test notification routing with app.openDialog
+local openDialogCalled = false
+local openDialogMsg = nil
+local openDialogErr = nil
+_G.app.openDialog = function(msg, options, cb, isError)
+    openDialogCalled = true
+    openDialogMsg = msg
+    openDialogErr = isError
+end
+
+plugin.notify("Test Notification", false)
+assert_true(openDialogCalled, "app.openDialog should be called by notify")
+assert_eq(openDialogMsg, "Test Notification", "Notification message must match")
+assert_eq(openDialogErr, false, "Notification isError must be false")
+
+plugin.notify("Test Error Notification", true)
+assert_eq(openDialogErr, true, "Notification isError must be true")
+
+-- Test CLI export fallback DPI calculation in width mode
+local docMock = {
+    xoppFilename = tempDir .. sep .. "test_note_mock.xopp",
+    currentPage = 1,
+    pages = { { pageWidth = 595.28, pageHeight = 842 } }
+}
+local fx = io.open(docMock.xoppFilename, "w") fx:write("mock xopp") fx:close()
+
+local capturedCliCmd = nil
+local originalOsExec = os.execute
+os.execute = function(cmd)
+    capturedCliCmd = cmd
+    return true, "exit", 0
+end
+
+plugin.config.mode = "width"
+plugin.config.width = 1920
+local savedExport = app.export
+app.export = nil
+
+local mockExportTarget = tempDir .. sep .. "test_cli_calc.png"
+local fTarget = io.open(mockExportTarget, "wb") fTarget:write("test") fTarget:close()
+
+local expFile, expErr = plugin.exportPage(1, mockExportTarget, docMock)
+assert_true(capturedCliCmd ~= nil, "CLI command should be executed on fallback")
+assert_true(capturedCliCmd:find("%-%-export%-png%-dpi="), "CLI command should use calculated DPI")
+assert_true(not capturedCliCmd:find("%-%-export%-png%-width"), "CLI command must NOT use unsupported --export-png-width")
+-- 1920 * 72 / 595.28 ≈ 232 DPI
+assert_true(capturedCliCmd:find("%-%-export%-png%-dpi=232") ~= nil, "CLI command should calculate correct equivalent DPI (232)")
+
+-- Restore mocks and cleanup
+os.execute = originalOsExec
+app.export = savedExport
+os.remove(docMock.xoppFilename)
+os.remove(mockExportTarget)
+plugin.config.mode = "dpi"
+plugin.config.dpi = 300
+
+print("  PASSED: UI registration, accelerator shortcut, dialog notifications, and CLI DPI calculation verified.")
 
 --------------------------------------------------------------------------------
 -- 7. Live Windows Clipboard Execution & Cleanup (if running on Windows)

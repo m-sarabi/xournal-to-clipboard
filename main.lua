@@ -32,6 +32,10 @@ CopyPagePlugin.config = {
 -- 2. Plugin directory (if writable)
 -- 3. User config directory fallback
 function CopyPagePlugin.getConfigFilePath()
+    if CopyPagePlugin.customConfigPath and CopyPagePlugin.customConfigPath ~= "" then
+        return CopyPagePlugin.customConfigPath
+    end
+
     local envPath = os.getenv("COPYPAGE_CONFIG_PATH")
     if envPath and envPath ~= "" then
         return envPath
@@ -48,10 +52,21 @@ function CopyPagePlugin.getConfigFilePath()
 
     if pluginDir and pluginDir ~= "" then
         local testPath = pluginDir .. sep .. "config.ini"
-        local testFile = io.open(testPath, "a")
-        if testFile then
-            testFile:close()
-            return testPath
+        if CopyPagePlugin.fileExists(testPath) then
+            local testFile = io.open(testPath, "r+")
+            if testFile then
+                testFile:close()
+                return testPath
+            end
+        else
+            -- Check if directory is writable using a temporary probe file
+            local probePath = pluginDir .. sep .. ".copypage_probe.tmp"
+            local probeFile = io.open(probePath, "w")
+            if probeFile then
+                probeFile:close()
+                pcall(os.remove, probePath)
+                return testPath
+            end
         end
     end
 
@@ -186,19 +201,30 @@ function CopyPagePlugin.detectOS()
     return "linux"
 end
 
+--- Safely escape an argument for POSIX shell command strings.
+-- Wraps in single quotes and replaces single quotes with '\''.
+-- @param str string argument to escape
+-- @return string safely escaped shell literal
+function CopyPagePlugin.shellEscape(str)
+    return "'" .. tostring(str):gsub("'", "'\\''") .. "'"
+end
+
 --- Build Windows PowerShell clipboard command using .NET Clipboard API.
 -- @param imagePath string absolute path to the PNG image
 -- @return string execution command
 function CopyPagePlugin.getWindowsClipboardCommand(imagePath)
     -- Normalize backslashes to forward slashes for clean PowerShell string literal handling
     local normalized = imagePath:gsub("\\", "/")
+    -- Escape single quotes for PowerShell single-quoted string literal (' -> '')
+    local escaped = normalized:gsub("'", "''")
     return string.format(
-        'powershell.exe -Sta -NoProfile -NonInteractive -WindowStyle Hidden -Command "' ..
+        'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' ..
         'Add-Type -AssemblyName System.Windows.Forms; ' ..
+        'Add-Type -AssemblyName System.Drawing; ' ..
         '$img = [System.Drawing.Image]::FromFile(\'%s\'); ' ..
         '[System.Windows.Forms.Clipboard]::SetImage($img); ' ..
         '$img.Dispose();"',
-        normalized
+        escaped
     )
 end
 
@@ -206,29 +232,30 @@ end
 -- @param imagePath string absolute path to the PNG image
 -- @return string execution command
 function CopyPagePlugin.getLinuxWaylandCommand(imagePath)
-    return string.format('wl-copy -t image/png < %q', imagePath)
+    return string.format('wl-copy -t image/png < %s', CopyPagePlugin.shellEscape(imagePath))
 end
 
 --- Build Linux X11 clipboard command.
 -- @param imagePath string absolute path to the PNG image
 -- @return string execution command
 function CopyPagePlugin.getLinuxX11Command(imagePath)
-    return string.format('xclip -selection clipboard -t image/png -i %q', imagePath)
+    return string.format('xclip -selection clipboard -t image/png -i %s', CopyPagePlugin.shellEscape(imagePath))
 end
 
 --- Build Linux universal clipboard command with Wayland (wl-copy) and X11 (xclip / xsel) fallback.
 -- @param imagePath string absolute path to the PNG image
 -- @return string execution command
 function CopyPagePlugin.getLinuxCommand(imagePath)
+    local q = CopyPagePlugin.shellEscape(imagePath)
     return string.format(
         'if command -v wl-copy >/dev/null 2>&1; then ' ..
-        'wl-copy -t image/png < %q; ' ..
+        'wl-copy -t image/png < %s; ' ..
         'elif command -v xclip >/dev/null 2>&1; then ' ..
-        'xclip -selection clipboard -t image/png -i %q; ' ..
+        'xclip -selection clipboard -t image/png -i %s; ' ..
         'elif command -v xsel >/dev/null 2>&1; then ' ..
-        'xsel -b -i < %q; ' ..
+        'xsel -b -i < %s; ' ..
         'else exit 127; fi',
-        imagePath, imagePath, imagePath
+        q, q, q
     )
 end
 
@@ -236,10 +263,11 @@ end
 -- @param imagePath string absolute path to the PNG image
 -- @return string execution command
 function CopyPagePlugin.getMacClipboardCommand(imagePath)
-    return string.format(
-        "osascript -e 'set the clipboard to (read (POSIX file %q) as «class PNGf»)'",
-        imagePath
-    )
+    -- Escape backslashes and double quotes for AppleScript string literal
+    local asEscaped = tostring(imagePath):gsub("\\", "\\\\"):gsub('"', '\\"')
+    local script = string.format('set the clipboard to (read (POSIX file "%s") as «class PNGf»)', asEscaped)
+    -- Escape single quotes for shell argument
+    return string.format("osascript -e '%s'", script:gsub("'", "'\\''"))
 end
 
 --- Form clipboard copy command for the specified or detected OS.
@@ -314,6 +342,42 @@ function CopyPagePlugin.createTempPngPath(osName)
     return fullPath, baseName, tempDir, sep
 end
 
+--- Generate all possible output filename candidates that Xournal++ may produce.
+-- @param basePath string destination path originally passed to export
+-- @param pageIndex number 1-based page index
+-- @return table list of candidate file paths
+function CopyPagePlugin.getCandidatePaths(basePath, pageIndex)
+    local candidates = { basePath }
+    local stem = basePath:match("^(.-)%.png$") or basePath
+    local idx = tonumber(pageIndex) or 1
+
+    -- Suffix formats with exact page index: -2.png, _2.png
+    table.insert(candidates, stem .. "-" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. "_" .. tostring(idx) .. ".png")
+
+    -- Suffix formats with index 1 (single-page export ranges): -1.png, _1.png
+    table.insert(candidates, stem .. "-1.png")
+    table.insert(candidates, stem .. "_1.png")
+
+    -- Zero-padded variants: -01, _01, -02, _02, -001, etc.
+    table.insert(candidates, stem .. string.format("-%02d.png", idx))
+    table.insert(candidates, stem .. string.format("_%02d.png", idx))
+    table.insert(candidates, stem .. string.format("-%03d.png", idx))
+    table.insert(candidates, stem .. string.format("_%03d.png", idx))
+    table.insert(candidates, stem .. string.format("-%04d.png", idx))
+    table.insert(candidates, stem .. string.format("_%04d.png", idx))
+    table.insert(candidates, stem .. "-01.png")
+    table.insert(candidates, stem .. "_01.png")
+
+    -- Descriptive variants: -page1.png, _page1.png, -page-1.png, _page_1.png
+    table.insert(candidates, stem .. "-page" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. "_page" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. "-page-" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. "_page_" .. tostring(idx) .. ".png")
+
+    return candidates
+end
+
 --- Find the exported PNG file on disk.
 -- Xournal++ image exports can produce `prefix.png` or `prefix-<pageNum>.png` or `prefix-1.png`.
 -- @param basePath string expected base file path
@@ -323,33 +387,12 @@ end
 -- @param sep string path separator
 -- @return string or nil path to verified file
 function CopyPagePlugin.findExportedPngFile(basePath, pageIndex, baseName, tempDir, sep)
-    -- Check 1: Direct file path
-    if CopyPagePlugin.fileExists(basePath) then
-        return basePath
-    end
-
-    local stem = basePath:match("^(.-)%.png$") or basePath
-
-    -- Check 2: Page index suffix: e.g. stem .. "-" .. pageIndex .. ".png"
-    if pageIndex then
-        local pagedPath = stem .. "-" .. tostring(pageIndex) .. ".png"
-        if CopyPagePlugin.fileExists(pagedPath) then
-            return pagedPath
+    local candidates = CopyPagePlugin.getCandidatePaths(basePath, pageIndex)
+    for _, path in ipairs(candidates) do
+        if CopyPagePlugin.fileExists(path) then
+            return path
         end
     end
-
-    -- Check 3: Suffix "-1.png" (common for single page range exports)
-    local singleSuffix = stem .. "-1.png"
-    if CopyPagePlugin.fileExists(singleSuffix) then
-        return singleSuffix
-    end
-
-    -- Check 4: Zero-padded suffix: "-01.png"
-    local paddedSuffix = stem .. "-01.png"
-    if CopyPagePlugin.fileExists(paddedSuffix) then
-        return paddedSuffix
-    end
-
     return nil
 end
 
@@ -372,17 +415,29 @@ end
 -- @param message string message to display
 -- @param isError boolean optional error flag
 function CopyPagePlugin.notify(message, isError)
+    local isErr = (isError == true)
     if not app then
         print("[CopyPageToClipboard] " .. message)
         return
     end
 
+    -- 1. Try modern Xournal++ 1.3.8+ dialog API: app.openDialog
+    if type(app.openDialog) == "function" then
+        local ok = pcall(app.openDialog, message, { "OK" }, "", isErr)
+        if ok then return end
+    end
+
+    -- 2. Try legacy app.msgbox with options table
     local msgFunc = app.msgbox or app.msgBox
     if type(msgFunc) == "function" then
-        pcall(msgFunc, message)
+        local ok = pcall(msgFunc, message, { [1] = "OK" })
+        if not ok then
+            pcall(msgFunc, message)
+        end
         return
     end
 
+    -- 3. Fallback to status bar or print
     if type(app.setStatus) == "function" then
         pcall(app.setStatus, message)
         return
@@ -428,43 +483,58 @@ function CopyPagePlugin.exportPage(pageIndex, targetPath, doc)
     local baseName = targetPath:match("([^/\\]+)%.png$")
     local tempDir, sep = CopyPagePlugin.getTempDir()
 
-    local exportSuccess = false
     local exportError = nil
+    local docWidth = (doc and doc.pages and doc.pages[pageIndex] and doc.pages[pageIndex].pageWidth) or 595.28
+    local calculatedDpi = math.floor(((tonumber(cfg.width) or 1920) * 72.0) / docWidth + 0.5)
 
     -- 1. Try Xournal++ Lua export API: app.export
     if app and type(app.export) == "function" then
-        local exportParams = {
+        -- Attempt 1: string range (e.g. "1")
+        local exportParams1 = {
             ["outputFile"] = targetPath,
             ["range"] = tostring(pageIndex)
         }
 
         if cfg.mode == "width" and cfg.width then
-            exportParams["pngWidth"] = tonumber(cfg.width)
+            exportParams1["pngWidth"] = tonumber(cfg.width)
+            exportParams1["pngDpi"] = calculatedDpi
         else
-            exportParams["pngDpi"] = tonumber(cfg.dpi) or 300
+            exportParams1["pngDpi"] = tonumber(cfg.dpi) or 300
         end
 
-        local ok, err = pcall(app.export, exportParams)
-        if ok then
+        local ok1, err1 = pcall(app.export, exportParams1)
+        if ok1 then
             local found = CopyPagePlugin.findExportedPngFile(targetPath, pageIndex, baseName, tempDir, sep)
             if found then
                 return found, nil
             end
         else
-            exportError = tostring(err)
+            exportError = tostring(err1)
+        end
+
+        -- Attempt 2: array range fallback (e.g. {1, 1})
+        local exportParams2 = {
+            ["outputFile"] = targetPath,
+            ["range"] = { pageIndex, pageIndex },
+            ["pngDpi"] = exportParams1["pngDpi"],
+            ["pngWidth"] = exportParams1["pngWidth"]
+        }
+        local ok2, err2 = pcall(app.export, exportParams2)
+        if ok2 then
+            local found = CopyPagePlugin.findExportedPngFile(targetPath, pageIndex, baseName, tempDir, sep)
+            if found then
+                return found, nil
+            end
+        else
+            if not exportError then exportError = tostring(err2) end
         end
     end
 
     -- 2. Fallback to CLI export if document has a saved filename on disk
     if doc and doc.xoppFilename and doc.xoppFilename ~= "" and CopyPagePlugin.fileExists(doc.xoppFilename) then
-        local cliCmd = nil
-        if cfg.mode == "width" and cfg.width then
-            cliCmd = string.format('xournalpp %q -i %q --export-range=%s --export-png-width=%d',
-                doc.xoppFilename, targetPath, tostring(pageIndex), tonumber(cfg.width))
-        else
-            cliCmd = string.format('xournalpp %q -i %q --export-range=%s --export-png-dpi=%d',
-                doc.xoppFilename, targetPath, tostring(pageIndex), tonumber(cfg.dpi) or 300)
-        end
+        local effectiveDpi = (cfg.mode == "width") and calculatedDpi or (tonumber(cfg.dpi) or 300)
+        local cliCmd = string.format('xournalpp %q -i %q --export-range=%s --export-png-dpi=%d',
+            doc.xoppFilename, targetPath, tostring(pageIndex), effectiveDpi)
 
         pcall(os.execute, cliCmd)
         local found = CopyPagePlugin.findExportedPngFile(targetPath, pageIndex, baseName, tempDir, sep)
@@ -511,12 +581,7 @@ function CopyPagePlugin.copyCurrentPage()
     local tempPath, baseName, tempDir, sep = CopyPagePlugin.createTempPngPath()
 
     -- Candidate paths to clean up
-    local filesToClean = {
-        tempPath,
-        tempDir .. sep .. baseName .. "-" .. tostring(pageIndex) .. ".png",
-        tempDir .. sep .. baseName .. "-1.png",
-        tempDir .. sep .. baseName .. "-01.png"
-    }
+    local filesToClean = CopyPagePlugin.getCandidatePaths(tempPath, pageIndex)
 
     local exportedFile, exportErr = CopyPagePlugin.exportPage(pageIndex, tempPath, doc)
     if not exportedFile then
