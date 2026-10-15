@@ -72,7 +72,7 @@ function CopyPagePlugin.getConfigFilePath()
 
     -- Fallback to OS user configuration directories
     if sep == "\\" then
-        local appdata = os.getenv("APPDATA") or os.getenv("LOCALAPPDATA") or os.getenv("USERPROFILE")
+        local appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.getenv("USERPROFILE")
         if appdata then
             return appdata .. "\\xournalpp\\copypage_config.ini"
         end
@@ -98,6 +98,14 @@ function CopyPagePlugin.loadConfig(filePath)
 
     local targetPath = filePath or CopyPagePlugin.getConfigFilePath()
     local file = io.open(targetPath, "r")
+    if not file and not filePath then
+        -- Check if fallback config exists in system temporary directory
+        local tempDir, sep = CopyPagePlugin.getTempDir()
+        local fallbackPath = tempDir .. sep .. "copypage_config.ini"
+        if fallbackPath ~= targetPath then
+            file = io.open(fallbackPath, "r")
+        end
+    end
     if not file then
         return cfg
     end
@@ -109,7 +117,13 @@ function CopyPagePlugin.loadConfig(filePath)
             local key, val = trimmed:match("^([%w_]+)%s*=%s*(.-)$")
             if key and val then
                 key = key:lower()
+                -- Strip trailing inline comments starting with # or ;
+                val = val:match("^([^#;]*)") or val
                 val = val:match("^%s*(.-)%s*$")
+                -- Strip optional surrounding quotes ("..." or '...')
+                if (#val >= 2) and ((val:sub(1, 1) == '"' and val:sub(-1) == '"') or (val:sub(1, 1) == "'" and val:sub(-1) == "'")) then
+                    val = val:sub(2, -2):match("^%s*(.-)%s*$")
+                end
                 if key == "mode" then
                     val = val:lower()
                     if val == "dpi" or val == "width" then
@@ -143,8 +157,32 @@ function CopyPagePlugin.saveConfig(filePath, configToSave)
 
     local file, err = io.open(targetPath, "w")
     if not file then
-        return false, tostring(err)
+        -- Attempt to create parent directory if missing
+        local dir = targetPath:match("^(.*)[/\\]")
+        if dir and dir ~= "" then
+            local sep = package.config:sub(1, 1)
+            if sep == "\\" then
+                pcall(os.execute, 'mkdir "' .. dir:gsub("/", "\\") .. '" 2>nul')
+            else
+                pcall(os.execute, 'mkdir -p "' .. dir .. '" 2>/dev/null')
+            end
+            file, err = io.open(targetPath, "w")
+        end
     end
+
+    if not file then
+        -- Last resort fallback: save to system temporary directory
+        local tempDir, sep = CopyPagePlugin.getTempDir()
+        local fallbackPath = tempDir .. sep .. "copypage_config.ini"
+        file, err = io.open(fallbackPath, "w")
+        if not file then
+            return false, tostring(err)
+        end
+    end
+
+    local modeVal = (cfg.mode == "width") and "width" or "dpi"
+    local dpiVal = tonumber(cfg.dpi) or DEFAULT_CONFIG.dpi
+    local widthVal = tonumber(cfg.width) or DEFAULT_CONFIG.width
 
     file:write("; CopyPageToClipboard Plugin Configuration\n")
     file:write("; Options:\n")
@@ -152,9 +190,9 @@ function CopyPagePlugin.saveConfig(filePath, configToSave)
     file:write(";   dpi = integer (e.g. 150, 300, 600)\n")
     file:write(";   width = integer pixels (e.g. 1280, 1920, 2560)\n\n")
     file:write("[settings]\n")
-    file:write(string.format("mode=%s\n", tostring(cfg.mode or DEFAULT_CONFIG.mode)))
-    file:write(string.format("dpi=%d\n", tonumber(cfg.dpi or DEFAULT_CONFIG.dpi)))
-    file:write(string.format("width=%d\n", tonumber(cfg.width or DEFAULT_CONFIG.width)))
+    file:write(string.format("mode=%s\n", modeVal))
+    file:write(string.format("dpi=%d\n", math.floor(dpiVal)))
+    file:write(string.format("width=%d\n", math.floor(widthVal)))
     file:close()
 
     return true, nil
@@ -377,6 +415,32 @@ function CopyPagePlugin.getCandidatePaths(basePath, pageIndex)
     table.insert(candidates, stem .. "-page-" .. tostring(idx) .. ".png")
     table.insert(candidates, stem .. "_page_" .. tostring(idx) .. ".png")
 
+    -- Short page-prefixed variants: -p1.png, _p1.png, -p01.png, _p01.png
+    table.insert(candidates, stem .. "-p" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. "_p" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. "-p1.png")
+    table.insert(candidates, stem .. "_p1.png")
+    table.insert(candidates, stem .. "-p" .. string.format("%02d", idx) .. ".png")
+    table.insert(candidates, stem .. "_p" .. string.format("%02d", idx) .. ".png")
+
+    -- Dot-separated variants: .1.png, .2.png, .p1.png
+    table.insert(candidates, stem .. "." .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. ".1.png")
+    table.insert(candidates, stem .. ".p" .. tostring(idx) .. ".png")
+    table.insert(candidates, stem .. ".p1.png")
+
+    -- 0-based page index variants (e.g. -0.png, _0.png, -page0.png, .0.png)
+    local zeroIdx = idx - 1
+    if zeroIdx >= 0 then
+        table.insert(candidates, stem .. "-" .. tostring(zeroIdx) .. ".png")
+        table.insert(candidates, stem .. "_" .. tostring(zeroIdx) .. ".png")
+        table.insert(candidates, stem .. string.format("-%02d.png", zeroIdx))
+        table.insert(candidates, stem .. string.format("_%02d.png", zeroIdx))
+        table.insert(candidates, stem .. "-page" .. tostring(zeroIdx) .. ".png")
+        table.insert(candidates, stem .. "_page" .. tostring(zeroIdx) .. ".png")
+        table.insert(candidates, stem .. "." .. tostring(zeroIdx) .. ".png")
+    end
+
     return candidates
 end
 
@@ -393,6 +457,29 @@ function CopyPagePlugin.findExportedPngFile(basePath, pageIndex, baseName, tempD
     for _, path in ipairs(candidates) do
         if CopyPagePlugin.fileExists(path) then
             return path
+        end
+    end
+    return nil
+end
+
+--- Find the exported PNG file on disk with retry to handle filesystem sync latency.
+-- @param basePath string expected base file path
+-- @param pageIndex number 1-based page index
+-- @param baseName string base name without extension
+-- @param tempDir string temp directory
+-- @param sep string path separator
+-- @param maxAttempts number optional maximum polling attempts (default 3)
+-- @return string or nil path to verified file
+function CopyPagePlugin.findExportedPngFileWithRetry(basePath, pageIndex, baseName, tempDir, sep, maxAttempts)
+    local attempts = maxAttempts or 3
+    for i = 1, attempts do
+        local found = CopyPagePlugin.findExportedPngFile(basePath, pageIndex, baseName, tempDir, sep)
+        if found then
+            return found
+        end
+        if i < attempts then
+            local t0 = os.clock()
+            while (os.clock() - t0) < 0.03 do end
         end
     end
     return nil
@@ -486,8 +573,11 @@ function CopyPagePlugin.exportPage(pageIndex, targetPath, doc)
     local tempDir, sep = CopyPagePlugin.getTempDir()
 
     local exportError = nil
-    local docWidth = (doc and doc.pages and doc.pages[pageIndex] and doc.pages[pageIndex].pageWidth) or 595.28
+    local pageInfo = doc and doc.pages and (doc.pages[pageIndex] or doc.pages[pageIndex - 1] or doc.pages[1])
+    local docWidth = (pageInfo and pageInfo.pageWidth and pageInfo.pageWidth > 0) and pageInfo.pageWidth or 595.28
+    if docWidth <= 0 then docWidth = 595.28 end
     local calculatedDpi = math.floor(((tonumber(cfg.width) or 1920) * 72.0) / docWidth + 0.5)
+    if calculatedDpi < 50 then calculatedDpi = 50 end
 
     -- 1. Try Xournal++ Lua export API: app.export
     if app and type(app.export) == "function" then
@@ -506,7 +596,7 @@ function CopyPagePlugin.exportPage(pageIndex, targetPath, doc)
 
         local ok1, err1 = pcall(app.export, exportParams1)
         if ok1 then
-            local found = CopyPagePlugin.findExportedPngFile(targetPath, pageIndex, baseName, tempDir, sep)
+            local found = CopyPagePlugin.findExportedPngFileWithRetry(targetPath, pageIndex, baseName, tempDir, sep)
             if found then
                 return found, nil
             end
@@ -523,7 +613,7 @@ function CopyPagePlugin.exportPage(pageIndex, targetPath, doc)
         }
         local ok2, err2 = pcall(app.export, exportParams2)
         if ok2 then
-            local found = CopyPagePlugin.findExportedPngFile(targetPath, pageIndex, baseName, tempDir, sep)
+            local found = CopyPagePlugin.findExportedPngFileWithRetry(targetPath, pageIndex, baseName, tempDir, sep)
             if found then
                 return found, nil
             end
@@ -535,11 +625,20 @@ function CopyPagePlugin.exportPage(pageIndex, targetPath, doc)
     -- 2. Fallback to CLI export if document has a saved filename on disk
     if doc and doc.xoppFilename and doc.xoppFilename ~= "" and CopyPagePlugin.fileExists(doc.xoppFilename) then
         local effectiveDpi = (cfg.mode == "width") and calculatedDpi or (tonumber(cfg.dpi) or 300)
-        local cliCmd = string.format('xournalpp %q -i %q --export-range=%s --export-png-dpi=%d',
-            doc.xoppFilename, targetPath, tostring(pageIndex), effectiveDpi)
+        local osType = CopyPagePlugin.detectOS()
+        local cliCmd
+        if osType == "windows" then
+            cliCmd = string.format('xournalpp "%s" -i "%s" --export-range=%s --export-png-dpi=%d',
+                doc.xoppFilename:gsub('"', ''), targetPath:gsub('"', ''), tostring(pageIndex), effectiveDpi)
+        else
+            cliCmd = string.format('xournalpp %s -i %s --export-range=%s --export-png-dpi=%d',
+                CopyPagePlugin.shellEscape(doc.xoppFilename),
+                CopyPagePlugin.shellEscape(targetPath),
+                tostring(pageIndex), effectiveDpi)
+        end
 
         pcall(os.execute, cliCmd)
-        local found = CopyPagePlugin.findExportedPngFile(targetPath, pageIndex, baseName, tempDir, sep)
+        local found = CopyPagePlugin.findExportedPngFileWithRetry(targetPath, pageIndex, baseName, tempDir, sep)
         if found then
             return found, nil
         end
@@ -572,7 +671,11 @@ function CopyPagePlugin.copyImageToClipboard(imagePath, filesToClean)
     if success then
         return true, nil
     else
-        return false, string.format("Clipboard command failed (status=%s, code=%s)", tostring(execStatus), tostring(execCode))
+        local errMsg = string.format("Clipboard command failed (status=%s, code=%s)", tostring(execStatus), tostring(execCode))
+        if osType == "linux" and (execCode == 127 or execStatus == false or execStatus == nil) then
+            errMsg = errMsg .. ". No clipboard tool found. Please install wl-clipboard (Wayland) or xclip/xsel (X11)."
+        end
+        return false, errMsg
     end
 end
 

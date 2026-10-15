@@ -97,6 +97,30 @@ assert_eq(safeConfig.mode, "dpi", "Invalid mode should fallback to default (dpi)
 assert_eq(safeConfig.dpi, 300, "Negative DPI should fallback to default (300)")
 assert_eq(safeConfig.width, 1920, "Out-of-range width should fallback to default (1920)")
 
+-- Test 2e: Comments, quotes, and whitespace in config loading
+local commentConfigPath = tempDir .. sep .. "comment_config.ini"
+local fc = io.open(commentConfigPath, "w")
+fc:write("  mode = \"width\" # inline comment\n")
+fc:write("  dpi = '600' ; trailing comment\n")
+fc:write("  width = 2560\n")
+fc:close()
+local parsedCommentConfig = plugin.loadConfig(commentConfigPath)
+assert_eq(parsedCommentConfig.mode, "width", "Quoted mode with inline comment should parse correctly")
+assert_eq(parsedCommentConfig.dpi, 600, "Quoted dpi with trailing comment should parse correctly")
+assert_eq(parsedCommentConfig.width, 2560, "Width should parse correctly")
+os.remove(commentConfigPath)
+
+-- Test 2f: Corrupted / non-numeric config table resilience in saveConfig
+local corruptConfig = { mode = "unexpected", dpi = "not_a_number", width = nil }
+local corruptSavePath = tempDir .. sep .. "corrupt_save_test.ini"
+local cSaveOk, cSaveErr = plugin.saveConfig(corruptSavePath, corruptConfig)
+assert_true(cSaveOk, "saveConfig should succeed even with corrupted values without runtime error")
+local reloadedCorrupt = plugin.loadConfig(corruptSavePath)
+assert_eq(reloadedCorrupt.mode, "dpi", "Corrupted mode should fallback to dpi")
+assert_eq(reloadedCorrupt.dpi, 300, "Corrupted dpi should fallback to 300")
+assert_eq(reloadedCorrupt.width, 1920, "Nil width should fallback to 1920")
+os.remove(corruptSavePath)
+
 -- Cleanup test config files
 os.remove(testConfigPath)
 os.remove(invalidConfigPath)
@@ -209,6 +233,19 @@ assert_true(macCmd:find("POSIX file"), "macOS command must use POSIX file handle
 -- Test macOS Command escaping
 local macEscaped = plugin.getMacClipboardCommand("/tmp/test 'image' \"quoted\".png")
 assert_true(macEscaped:find("\\\"quoted\\\"") ~= nil, "macOS command must escape double quotes for AppleScript")
+
+-- Test Linux missing clipboard tool informative error message
+local savedDetect = plugin.detectOS
+plugin.detectOS = function() return "linux" end
+local origExec = os.execute
+os.execute = function() return nil, "exit", 127 end
+local lOk, lErr = plugin.copyImageToClipboard("/tmp/test.png", {})
+assert_true(not lOk, "copyImageToClipboard should report failure on exit code 127")
+assert_true(lErr:find("wl%-clipboard") ~= nil, "Linux exit code 127 error message should mention wl-clipboard")
+assert_true(lErr:find("xclip") ~= nil, "Linux exit code 127 error message should mention xclip")
+os.execute = origExec
+plugin.detectOS = savedDetect
+
 print("  PASSED: Cross-platform clipboard commands correctly formed and escaped for Windows, Linux, and macOS.")
 
 --------------------------------------------------------------------------------
@@ -260,6 +297,24 @@ local dummyPagePrefixed = dummyBase .. "_page3.png"
 local fF = io.open(dummyPagePrefixed, "wb") fF:write("dummy") fF:close()
 assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 3), dummyPagePrefixed, "Should find page-prefixed match")
 os.remove(dummyPagePrefixed)
+
+-- Case G: 0-based suffix match (e.g. -0.png for page 1)
+local dummyZero = dummyBase .. "-0.png"
+local fG = io.open(dummyZero, "wb") fG:write("dummy") fG:close()
+assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 1), dummyZero, "Should find 0-based -0.png match")
+os.remove(dummyZero)
+
+-- Case H: Dot-separated match (e.g. .1.png)
+local dummyDot = dummyBase .. ".1.png"
+local fH = io.open(dummyDot, "wb") fH:write("dummy") fH:close()
+assert_eq(plugin.findExportedPngFile(dummyBase .. ".png", 1), dummyDot, "Should find dot-separated .1.png match")
+os.remove(dummyDot)
+
+-- Case I: findExportedPngFileWithRetry verifies finding existing file
+local dummyRetry = dummyBase .. "-retry.png"
+local fI = io.open(dummyRetry, "wb") fI:write("dummy") fI:close()
+assert_eq(plugin.findExportedPngFileWithRetry(dummyRetry, 1), dummyRetry, "findExportedPngFileWithRetry should find existing file")
+os.remove(dummyRetry)
 
 -- Test cleanupFiles safely removes list of files
 local cleanFile1 = tempDir .. sep .. "clean_test_1.tmp"

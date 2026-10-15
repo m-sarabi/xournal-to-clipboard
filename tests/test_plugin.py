@@ -210,6 +210,39 @@ class TestCopyPageToClipboard(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0, "PowerShell should fail with non-zero exit code on missing file")
         self.assertIn("FromFile", res.stderr, "Error message should mention FromFile exception")
 
+    def test_cross_platform_command_formation(self):
+        """Verify command formation and escaping for Linux and macOS via Lua."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local p = require("main"); '
+            'local lc = p.getLinuxCommand("/tmp/test with \'quotes\' and $VAR.png"); '
+            'local mc = p.getMacClipboardCommand("/tmp/test with \\"quotes\\".png"); '
+            'assert(lc:find("wl%-copy"), "Linux cmd must have wl-copy"); '
+            'assert(lc:find("xclip"), "Linux cmd must have xclip"); '
+            'assert(mc:find("«class PNGf»"), "macOS cmd must have PNG class"); '
+            'print("OK_COMMANDS");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua command formation test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_COMMANDS", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
 
 if __name__ == "__main__":
     unittest.main()
