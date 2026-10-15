@@ -89,6 +89,25 @@ class TestCopyPageToClipboard(unittest.TestCase):
         except FileNotFoundError:
             self.skipTest("texlua interpreter not found in PATH")
 
+    def _clear_windows_clipboard(self):
+        """Helper to clear Windows clipboard to prevent stale clipboard state."""
+        clear_cmd = (
+            'powershell.exe -Sta -NoProfile -NonInteractive -Command "'
+            'Add-Type -AssemblyName System.Windows.Forms; '
+            '[System.Windows.Forms.Clipboard]::Clear();"'
+        )
+        subprocess.run(clear_cmd, shell=True, capture_output=True, check=True)
+
+    def _get_windows_clipboard_image_dims(self):
+        """Helper to retrieve image dimensions from Windows clipboard."""
+        verify_script = (
+            'powershell.exe -Sta -NoProfile -NonInteractive -Command "'
+            'Add-Type -AssemblyName System.Windows.Forms; '
+            '$c = [System.Windows.Forms.Clipboard]::GetImage(); '
+            'if ($c -ne $null) { Write-Output ($c.Width.ToString() + \'x\' + $c.Height.ToString()) } else { Write-Output \'NONE\' }"'
+        )
+        return subprocess.check_output(verify_script, shell=True, text=True).strip()
+
     def test_clipboard_powershell_windows(self):
         """Verify Windows PowerShell clipboard command actually sets image on Windows."""
         if sys.platform != "win32":
@@ -96,6 +115,9 @@ class TestCopyPageToClipboard(unittest.TestCase):
 
         import tempfile
         from PIL import Image
+
+        self._clear_windows_clipboard()
+        self.assertEqual(self._get_windows_clipboard_image_dims(), "NONE", "Clipboard should be empty before test")
 
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
@@ -106,26 +128,23 @@ class TestCopyPageToClipboard(unittest.TestCase):
             img.save(tmp_path)
 
             norm_path = tmp_path.replace("\\", "/")
+            escaped_path = norm_path.replace("'", "''")
             ps_cmd = (
-                f'powershell.exe -Sta -NoProfile -NonInteractive -WindowStyle Hidden -Command "'
+                f'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "'
+                f'$img = $null; try {{ '
                 f'Add-Type -AssemblyName System.Windows.Forms; '
-                f'$img = [System.Drawing.Image]::FromFile(\'{norm_path}\'); '
-                f'[System.Windows.Forms.Clipboard]::SetImage($img); '
-                f'$img.Dispose();"'
+                f'Add-Type -AssemblyName System.Drawing; '
+                f'$img = [System.Drawing.Image]::FromFile(\'{escaped_path}\'); '
+                f'[System.Windows.Forms.Clipboard]::SetDataObject($img, $true, 10, 100); '
+                f'}} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }} '
+                f'finally {{ if ($null -ne $img) {{ $img.Dispose() }} }}"'
             )
 
             res = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"PowerShell command failed:\n{res.stderr}")
 
-            # Verify clipboard contains image
-            verify_script = (
-                "powershell.exe -Sta -NoProfile -NonInteractive -Command \""
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$c = [System.Windows.Forms.Clipboard]::GetImage(); "
-                "if ($c -ne $null) { Write-Output ($c.Width.ToString() + 'x' + $c.Height.ToString()) } else { Write-Output 'NONE' }\""
-            )
-            verify_res = subprocess.check_output(verify_script, shell=True, text=True).strip()
-            self.assertEqual(verify_res, "64x64", f"Clipboard did not contain expected image, got: {verify_res}")
+            dims = self._get_windows_clipboard_image_dims()
+            self.assertEqual(dims, "64x64", f"Clipboard did not contain expected image, got: {dims}")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -136,10 +155,15 @@ class TestCopyPageToClipboard(unittest.TestCase):
             self.skipTest("Windows-only clipboard test")
 
         import tempfile
+        import time
         from PIL import Image
 
+        self._clear_windows_clipboard()
+        self.assertEqual(self._get_windows_clipboard_image_dims(), "NONE", "Clipboard should be empty before test")
+
         temp_dir = tempfile.gettempdir()
-        tmp_path = os.path.join(temp_dir, "test_O'Connor_note.png")
+        unique_name = f"test_O'Connor_note_{os.getpid()}_{int(time.time()*1000)}.png"
+        tmp_path = os.path.join(temp_dir, unique_name)
 
         try:
             img = Image.new("RGB", (32, 32), color=(0, 128, 255))
@@ -149,27 +173,42 @@ class TestCopyPageToClipboard(unittest.TestCase):
             escaped_path = norm_path.replace("'", "''")
             ps_cmd = (
                 f'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "'
+                f'$img = $null; try {{ '
                 f'Add-Type -AssemblyName System.Windows.Forms; '
                 f'Add-Type -AssemblyName System.Drawing; '
                 f'$img = [System.Drawing.Image]::FromFile(\'{escaped_path}\'); '
-                f'[System.Windows.Forms.Clipboard]::SetImage($img); '
-                f'$img.Dispose();"'
+                f'[System.Windows.Forms.Clipboard]::SetDataObject($img, $true, 10, 100); '
+                f'}} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }} '
+                f'finally {{ if ($null -ne $img) {{ $img.Dispose() }} }}"'
             )
 
             res = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"PowerShell command failed with apostrophe in path:\n{res.stderr}")
 
-            verify_script = (
-                "powershell.exe -Sta -NoProfile -NonInteractive -Command \""
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$c = [System.Windows.Forms.Clipboard]::GetImage(); "
-                "if ($c -ne $null) { Write-Output ($c.Width.ToString() + 'x' + $c.Height.ToString()) } else { Write-Output 'NONE' }\""
-            )
-            verify_res = subprocess.check_output(verify_script, shell=True, text=True).strip()
-            self.assertEqual(verify_res, "32x32", f"Clipboard did not contain expected 32x32 image, got: {verify_res}")
+            dims = self._get_windows_clipboard_image_dims()
+            self.assertEqual(dims, "32x32", f"Clipboard did not contain expected 32x32 image, got: {dims}")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def test_clipboard_powershell_error_handling(self):
+        """Verify Windows PowerShell command exits with non-zero status on error (e.g. missing file)."""
+        if sys.platform != "win32":
+            self.skipTest("Windows-only clipboard test")
+
+        ps_cmd = (
+            'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "'
+            '$img = $null; try { '
+            'Add-Type -AssemblyName System.Windows.Forms; '
+            'Add-Type -AssemblyName System.Drawing; '
+            '$img = [System.Drawing.Image]::FromFile(\'C:/nonexistent_image_path_12345.png\'); '
+            '[System.Windows.Forms.Clipboard]::SetDataObject($img, $true, 10, 100); '
+            '} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 } '
+            'finally { if ($null -ne $img) { $img.Dispose() } }"'
+        )
+        res = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, "PowerShell should fail with non-zero exit code on missing file")
+        self.assertIn("FromFile", res.stderr, "Error message should mention FromFile exception")
 
 
 if __name__ == "__main__":

@@ -219,11 +219,13 @@ function CopyPagePlugin.getWindowsClipboardCommand(imagePath)
     local escaped = normalized:gsub("'", "''")
     return string.format(
         'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' ..
+        '$img = $null; try { ' ..
         'Add-Type -AssemblyName System.Windows.Forms; ' ..
         'Add-Type -AssemblyName System.Drawing; ' ..
         '$img = [System.Drawing.Image]::FromFile(\'%s\'); ' ..
-        '[System.Windows.Forms.Clipboard]::SetImage($img); ' ..
-        '$img.Dispose();"',
+        '[System.Windows.Forms.Clipboard]::SetDataObject($img, $true, 10, 100); ' ..
+        '} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 } ' ..
+        'finally { if ($null -ne $img) { $img.Dispose() } }"',
         escaped
     )
 end

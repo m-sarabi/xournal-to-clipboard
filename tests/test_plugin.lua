@@ -165,10 +165,13 @@ assert_true(winCmd:find("powershell%.exe"), "Windows command must invoke powersh
 assert_true(winCmd:find("-Sta"), "Windows command must use -Sta for STA apartment state")
 assert_true(winCmd:find("System%.Windows%.Forms"), "Windows command must load System.Windows.Forms")
 assert_true(winCmd:find("System%.Drawing"), "Windows command must load System.Drawing")
-assert_true(winCmd:find("Clipboard%]:%:SetImage"), "Windows command must call SetImage")
+assert_true(winCmd:find("Clipboard%]:%:SetDataObject") or winCmd:find("Clipboard%]:%:SetImage"), "Windows command must call SetDataObject or SetImage")
 assert_true(winCmd:find("Dispose%(%)"), "Windows command must dispose image to release file lock")
 assert_true(not winCmd:find("\\"), "Windows command should normalize backslashes to forward slashes")
 assert_true(winCmd:find("-ExecutionPolicy Bypass"), "Windows command should use -ExecutionPolicy Bypass")
+assert_true(winCmd:find("try"), "Windows command must use try block for robust error handling")
+assert_true(winCmd:find("catch"), "Windows command must use catch block")
+assert_true(winCmd:find("exit 1"), "Windows command must exit 1 on failure")
 
 -- Test Windows Command with embedded single quotes (e.g. John O'Connor)
 local winCmdQuotes = plugin.getWindowsClipboardCommand("C:\\Users\\John O'Connor\\AppData\\Local\\Temp\\page.png")
@@ -399,7 +402,18 @@ if detected == "windows" then
     local copyOk, copyErr = plugin.copyImageToClipboard(testPngPath, { testPngPath })
     assert_true(copyOk, "copyImageToClipboard should execute successfully: " .. tostring(copyErr))
     assert_true(not plugin.fileExists(testPngPath), "Live test PNG file should be safely deleted after transfer")
-    print("  PASSED: Live Windows PowerShell/.NET clipboard copy and cleanup succeeded.")
+
+    -- Test live copy with apostrophe / single-quote in path
+    local testAposPath = tempDir .. sep .. "live_clip_O'Connor_test_" .. tostring(os.time()) .. ".png"
+    local fp2 = io.open(testAposPath, "wb")
+    fp2:write(pngBytes)
+    fp2:close()
+    assert_true(plugin.fileExists(testAposPath), "Live apostrophe test PNG should be created")
+    local copyAposOk, copyAposErr = plugin.copyImageToClipboard(testAposPath, { testAposPath })
+    assert_true(copyAposOk, "copyImageToClipboard with apostrophe path should execute successfully: " .. tostring(copyAposErr))
+    assert_true(not plugin.fileExists(testAposPath), "Live apostrophe test PNG should be safely deleted after transfer")
+
+    print("  PASSED: Live Windows PowerShell/.NET clipboard copy and cleanup succeeded (standard and apostrophe paths).")
 end
 
 print("\n======================================================================")
