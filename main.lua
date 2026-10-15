@@ -378,13 +378,14 @@ function CopyPagePlugin.getLinuxCommand(imagePath, filesToClean, isAsync)
     end
 
     local base = string.format(
+        'ret=0; ' ..
         'if command -v wl-copy >/dev/null 2>&1; then ' ..
-        'wl-copy -t image/png < %s; ' ..
+        'wl-copy -t image/png < %s || ret=$?; ' ..
         'elif command -v xclip >/dev/null 2>&1; then ' ..
-        'xclip -selection clipboard -t image/png -i %s; ' ..
+        'xclip -selection clipboard -t image/png -i %s || ret=$?; ' ..
         'elif command -v xsel >/dev/null 2>&1; then ' ..
-        'xsel -b -i < %s; ' ..
-        'else exit 127; fi%s',
+        'xsel -b -i < %s || ret=$?; ' ..
+        'else ret=127; fi%s; exit $ret',
         q, q, q, cleanupSnippet
     )
 
@@ -986,15 +987,17 @@ function CopyPagePlugin.getWindowsDialogCommand(currentConfig)
         '$f.Controls.Add($btnCan); ' ..
         '$f.TopMost = $true; ' ..
         '$res = $f.ShowDialog(); ' ..
-        'if ($res -eq [System.Windows.Forms.DialogResult]::OK) { ' ..
+        '$outStr = if ($res -eq [System.Windows.Forms.DialogResult]::OK) { ' ..
         '$m = if ($rbW.Checked) { \'width\' } else { \'dpi\' }; ' ..
-        'Write-Output \"MODE=$m;VALUE=$($txt.Text.Trim())\"; ' ..
-        '} else { Write-Output \'CANCEL\'; }',
+        '\"MODE=$m;VALUE=$($txt.Text.Trim())\" ' ..
+        '} else { \'CANCEL\' }; ' ..
+        '$f.Dispose(); ' ..
+        'Write-Output $outStr;',
         dpiChecked, widthChecked, initVal
     )
 
     return string.format(
-        'powershell.exe -Sta -NoProfile -ExecutionPolicy Bypass -Command "%s"',
+        'powershell.exe -Sta -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "%s"',
         ps
     )
 end
@@ -1074,45 +1077,50 @@ function CopyPagePlugin.promptQualityDialog()
     if okLgi and lgi then
         local okGtk, Gtk = pcall(lgi.require, "Gtk", "3.0")
         if okGtk and Gtk and Gtk.Dialog then
-            local isWidth = (CopyPagePlugin.config.mode == "width")
-            local initVal = isWidth and tostring(CopyPagePlugin.config.width or 1920) or tostring(CopyPagePlugin.config.dpi or 300)
+            local okRun, result = pcall(function()
+                local isWidth = (CopyPagePlugin.config.mode == "width")
+                local initVal = isWidth and tostring(CopyPagePlugin.config.width or 1920) or tostring(CopyPagePlugin.config.dpi or 300)
 
-            local dlg = Gtk.Dialog({
-                title = "Copy Quality Settings",
-                modal = true,
-                destroy_with_parent = true
-            })
-            dlg:add_button("Cancel", Gtk.ResponseType.CANCEL)
-            dlg:add_button("OK", Gtk.ResponseType.OK)
+                local dlg = Gtk.Dialog({
+                    title = "Copy Quality Settings",
+                    modal = true,
+                    destroy_with_parent = true
+                })
+                dlg:add_button("Cancel", Gtk.ResponseType.CANCEL)
+                dlg:add_button("OK", Gtk.ResponseType.OK)
 
-            local content = dlg:get_content_area()
-            content:set_spacing(8)
-            content:set_border_width(12)
+                local content = dlg:get_content_area()
+                content:set_spacing(8)
+                content:set_border_width(12)
 
-            local lblMode = Gtk.Label({ label = "<b>Quality Mode:</b>", use_markup = true, xalign = 0 })
-            content:add(lblMode)
+                local lblMode = Gtk.Label({ label = "<b>Quality Mode:</b>", use_markup = true, xalign = 0 })
+                content:add(lblMode)
 
-            local rbDpi = Gtk.RadioButton({ label = "DPI (dots per inch)", active = not isWidth })
-            local rbWidth = Gtk.RadioButton({ label = "Fixed Width (pixels)", group = rbDpi, active = isWidth })
-            content:add(rbDpi)
-            content:add(rbWidth)
+                local rbDpi = Gtk.RadioButton({ label = "DPI (dots per inch)", active = not isWidth })
+                local rbWidth = Gtk.RadioButton({ label = "Fixed Width (pixels)", group = rbDpi, active = isWidth })
+                content:add(rbDpi)
+                content:add(rbWidth)
 
-            local lblVal = Gtk.Label({ label = "<b>Value (DPI: 50-2400, Width: 100-10000):</b>", use_markup = true, xalign = 0 })
-            content:add(lblVal)
+                local lblVal = Gtk.Label({ label = "<b>Value (DPI: 50-2400, Width: 100-10000):</b>", use_markup = true, xalign = 0 })
+                content:add(lblVal)
 
-            local entry = Gtk.Entry({ text = initVal })
-            content:add(entry)
+                local entry = Gtk.Entry({ text = initVal })
+                content:add(entry)
 
-            dlg:show_all()
-            local response = dlg:run()
-            local chosenMode = rbWidth:get_active() and "width" or "dpi"
-            local textVal = entry:get_text() or ""
-            dlg:destroy()
+                dlg:show_all()
+                local response = dlg:run()
+                local chosenMode = rbWidth:get_active() and "width" or "dpi"
+                local textVal = entry:get_text() or ""
+                dlg:destroy()
 
-            if response == Gtk.ResponseType.OK then
-                return string.format("MODE=%s;VALUE=%s", chosenMode, textVal)
-            else
-                return "CANCEL"
+                if response == Gtk.ResponseType.OK then
+                    return string.format("MODE=%s;VALUE=%s", chosenMode, textVal)
+                else
+                    return "CANCEL"
+                end
+            end)
+            if okRun and result then
+                return result
             end
         end
     end
@@ -1153,6 +1161,10 @@ function CopyPagePlugin.parseQualityInput(inputStr, defaultMode)
         return nil, "Cancelled"
     end
 
+    if raw:match("^([^|]+)|%s*$") then
+        return nil, "No quality value entered."
+    end
+
     -- Check structured output: MODE=xxx;VALUE=yyy or MODE=xxx|VALUE=yyy
     local sMode, sVal = raw:match("^[Mm][Oo][Dd][Ee]%s*[:=]%s*([%w_]+)%s*[;|]%s*[Vv][Aa][Ll][Uu][Ee]%s*[:=]%s*(.-)$")
     if not sMode then
@@ -1177,7 +1189,13 @@ function CopyPagePlugin.parseQualityInput(inputStr, defaultMode)
         if m == "dpi" or m == "width" then
             mode = m
         end
-        num = tonumber(sVal:match("(%d+)"))
+        local sign, digits = sVal:match("([%+%-]?)%s*(%d+%.?%d*)")
+        if digits and digits ~= "" then
+            num = tonumber(digits)
+            if num and sign == "-" then
+                num = -num
+            end
+        end
     else
         local lower = raw:lower()
         if lower:find("width") or lower:find("px") or lower:find("pixel") or lower:match("%d+%s*w$") then
@@ -1186,15 +1204,20 @@ function CopyPagePlugin.parseQualityInput(inputStr, defaultMode)
             mode = "dpi"
         end
 
-        local digits = lower:match("(%d+)")
-        if digits then
+        local sign, digits = lower:match("([%+%-]?)%s*(%d+%.?%d*)")
+        if digits and digits ~= "" then
             num = tonumber(digits)
+            if num and sign == "-" then
+                num = -num
+            end
         end
     end
 
     if not num then
         return nil, string.format("Invalid numeric value in '%s'.", raw)
     end
+
+    num = math.floor(num)
 
     if mode == "dpi" then
         if num < 50 or num > 2400 then

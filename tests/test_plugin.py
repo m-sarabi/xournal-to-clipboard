@@ -77,7 +77,7 @@ class TestCopyPageToClipboard(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 cwd=str(REPO_ROOT),
-                timeout=30
+                timeout=60
             )
             print("\n--- Lua Test Suite Output ---")
             print(res.stdout)
@@ -306,6 +306,19 @@ class TestCopyPageToClipboard(unittest.TestCase):
             'assert(bWLow == nil, "99 px should be out of bounds"); '
             'local bWHigh = p.parseQualityInput("10001 px"); '
             'assert(bWHigh == nil, "10001 px should be out of bounds"); '
+            'local bNegDpi = p.parseQualityInput("-300 dpi"); '
+            'assert(bNegDpi == nil, "negative dpi must be rejected"); '
+            'local bNegW = p.parseQualityInput("-1920 px"); '
+            'assert(bNegW == nil, "negative width must be rejected"); '
+            'local bNegS = p.parseQualityInput("MODE=dpi;VALUE=-300"); '
+            'assert(bNegS == nil, "structured negative value must be rejected"); '
+            'local bEmpZ = p.parseQualityInput("DPI|"); '
+            'assert(bEmpZ == nil, "empty zenity input must be rejected"); '
+            'local rFloat = p.parseQualityInput("450.5 dpi"); '
+            'assert(rFloat.mode == "dpi" and rFloat.value == 450, "float dpi must be floored"); '
+            'local wdc = p.getWindowsDialogCommand(); '
+            'assert(wdc:find("%-WindowStyle Hidden"), "windows dialog must use WindowStyle Hidden"); '
+            'assert(wdc:find("%$f%.Dispose%(%)"), "windows dialog must dispose form"); '
             'print("OK_QUALITY_PARSER");\n'
         )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:

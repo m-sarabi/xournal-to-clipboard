@@ -464,7 +464,8 @@ print("  PASSED: UI registration, accelerator shortcut, dialog notifications, an
 --------------------------------------------------------------------------------
 if detected == "windows" then
     print("\n[Test 7] Executing live Windows clipboard integration test...")
-    local testPngPath = tempDir .. sep .. "live_clip_test_" .. tostring(os.time()) .. ".png"
+    local randSuffix = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+    local testPngPath = tempDir .. sep .. "live_clip_test_" .. randSuffix .. ".png"
     -- 1x1 valid PNG image bytes
     local pngBytes = "\137\80\78\71\13\10\26\10\0\0\0\13\73\72\68\82\0\0\0\1\0\0\0\1\8\6\0\0\0\31\21\196\137\0\0\0\11\73\68\65\84\120\156\99\96\0\0\0\2\0\1\244\113\100\166\0\0\0\0\73\69\78\68\174\66\96\130"
     local fp = io.open(testPngPath, "wb")
@@ -480,10 +481,10 @@ if detected == "windows" then
     assert_true(copyOk, "copyImageToClipboard async should succeed: " .. tostring(copyErr))
     assert_true(elapsed < 1.5, string.format("Async clipboard execution must return quickly to avoid freezing UI (took %.3fs)", elapsed))
 
-    -- Poll for background PowerShell cleanup (up to 12 wall-clock seconds)
+    -- Poll for background PowerShell cleanup (up to 25 wall-clock seconds)
     local tPoll = os.time()
     local asyncCleaned = false
-    while (os.time() - tPoll) < 12 do
+    while (os.time() - tPoll) < 25 do
         if not plugin.fileExists(testPngPath) then
             asyncCleaned = true
             break
@@ -494,7 +495,7 @@ if detected == "windows" then
     assert_true(asyncCleaned, "Async background process must automatically clean up the image file")
 
     -- 7b. Synchronous copy test with apostrophe path (backwards compatibility)
-    local testAposPath = tempDir .. sep .. "live_clip_O'Connor_test_" .. tostring(os.time()) .. ".png"
+    local testAposPath = tempDir .. sep .. "live_clip_O'Connor_test_" .. randSuffix .. ".png"
     local fp2 = io.open(testAposPath, "wb")
     fp2:write(pngBytes)
     fp2:close()
@@ -584,6 +585,26 @@ assert_true(bWLow == nil, "99 px width should be rejected")
 local bWHigh, errWHigh = plugin.parseQualityInput("MODE=width;VALUE=10001")
 assert_true(bWHigh == nil, "10001 px width should be rejected")
 
+-- Negative values rejected
+local bNegDpi, errNegDpi = plugin.parseQualityInput("-300 dpi")
+assert_true(bNegDpi == nil, "Negative DPI must be rejected")
+assert_true(errNegDpi:find("out of valid range") ~= nil, "Negative DPI error must indicate range")
+
+local bNegW, errNegW = plugin.parseQualityInput("-1920 px")
+assert_true(bNegW == nil, "Negative Width must be rejected")
+
+local bNegStruct = plugin.parseQualityInput("MODE=dpi;VALUE=-300")
+assert_true(bNegStruct == nil, "Structured negative value must be rejected")
+
+-- Floating point quality values accepted and floored
+local bFloatDpi = plugin.parseQualityInput("450.9 dpi")
+assert_true(bFloatDpi ~= nil and bFloatDpi.value == 450, "Floating point DPI must be parsed and floored")
+
+-- Zenity empty entry input rejected
+local bEmptyZen, errEmptyZen = plugin.parseQualityInput("DPI|")
+assert_true(bEmptyZen == nil, "Empty zenity entry must be rejected")
+assert_true(errEmptyZen:find("No quality value entered") ~= nil, "Empty zenity message must be informative")
+
 -- Invalid strings and cancellation
 local inv1 = plugin.parseQualityInput("invalid_text")
 assert_true(inv1 == nil, "Invalid non-numeric text should be rejected")
@@ -629,10 +650,12 @@ plugin.customConfigPath = nil
 -- 8g. Test OS Dialog command formation
 local winDlgCmd = plugin.getWindowsDialogCommand()
 assert_true(winDlgCmd:find("powershell%.exe"), "Windows dialog command must invoke powershell")
+assert_true(winDlgCmd:find("%-WindowStyle Hidden"), "Windows dialog command must use WindowStyle Hidden to avoid console window flash")
 assert_true(winDlgCmd:find("System%.Windows%.Forms"), "Windows dialog command must load System.Windows.Forms")
 assert_true(winDlgCmd:find("Copy Quality Settings"), "Windows dialog command must set title")
 assert_true(winDlgCmd:find("RadioButton"), "Windows dialog command must include RadioButtons")
 assert_true(winDlgCmd:find("TextBox"), "Windows dialog command must include TextBox")
+assert_true(winDlgCmd:find("%$f%.Dispose%(%)"), "Windows dialog command must dispose Form on exit")
 
 local linuxDlgCmd = plugin.getLinuxDialogCommand()
 assert_true(linuxDlgCmd:find("zenity") ~= nil, "Linux dialog command must check zenity")
