@@ -246,7 +246,22 @@ assert_true(lErr:find("xclip") ~= nil, "Linux exit code 127 error message should
 os.execute = origExec
 plugin.detectOS = savedDetect
 
-print("  PASSED: Cross-platform clipboard commands correctly formed and escaped for Windows, Linux, and macOS.")
+-- Test Asynchronous Clipboard Commands & Background Cleanup formatting
+local asyncWinCmd = plugin.getWindowsClipboardCommand("C:\\page.png", { "C:\\page.png", "C:\\page-1.png" }, true)
+assert_true(asyncWinCmd:find('start "" /B'), "Windows async command must use start \"\" /B")
+assert_true(asyncWinCmd:find("Remove%-Item"), "Windows async command must include Remove-Item in finally block")
+assert_true(asyncWinCmd:find("@%('C:/page%.png', 'C:/page%-1%.png'%)") ~= nil, "Windows async command must format file cleanup array")
+
+local asyncLinuxCmd = plugin.getLinuxCommand("/tmp/page.png", { "/tmp/page.png", "/tmp/page-1.png" }, true)
+assert_true(asyncLinuxCmd:sub(1, 2) == "( ", "Linux async command must start with subshell (")
+assert_true(asyncLinuxCmd:find("&%s*$") ~= nil, "Linux async command must end with background operator &")
+assert_true(asyncLinuxCmd:find("rm %-f '/tmp/page%.png' '/tmp/page%-1%.png'") ~= nil, "Linux async command must include rm -f cleanup")
+
+local asyncMacCmd = plugin.getMacClipboardCommand("/tmp/page.png", { "/tmp/page.png" }, true)
+assert_true(asyncMacCmd:find("&%s*$") ~= nil, "macOS async command must end with background operator &")
+assert_true(asyncMacCmd:find("rm %-f '/tmp/page%.png'") ~= nil, "macOS async command must include rm -f cleanup")
+
+print("  PASSED: Cross-platform clipboard commands correctly formed and escaped for Windows, Linux, and macOS (sync & async).")
 
 --------------------------------------------------------------------------------
 -- 5. Temporary File Management & Path Resolution
@@ -359,13 +374,16 @@ _G.app = {
 -- Execute initUi()
 initUi()
 
-assert_true(#registeredMenus >= 6, "At least 6 UI menu actions should be registered")
+assert_eq(#registeredMenus, 2, "Exactly 2 UI menu actions should be registered (decluttered)")
 local hasPrimaryMenu = false
+local hasQualityMenu = false
 local hasCtrlAltC = false
 
 for _, menu in ipairs(registeredMenus) do
     if menu:find("Copy Current Page") then
         hasPrimaryMenu = true
+    elseif menu:find("Quality Settings") then
+        hasQualityMenu = true
     end
 end
 
@@ -376,6 +394,7 @@ for _, acc in ipairs(registeredAccelerators) do
 end
 
 assert_true(hasPrimaryMenu, "Primary 'Copy Current Page to Clipboard' menu must be registered")
+assert_true(hasQualityMenu, "Single 'Quality Settings...' menu item must be registered")
 assert_true(hasCtrlAltC, "<Control><Alt>c accelerator shortcut must be bound")
 
 -- Verify active page index resolution
@@ -454,22 +473,179 @@ if detected == "windows" then
 
     assert_true(plugin.fileExists(testPngPath), "Live test PNG file should be created")
 
-    local copyOk, copyErr = plugin.copyImageToClipboard(testPngPath, { testPngPath })
-    assert_true(copyOk, "copyImageToClipboard should execute successfully: " .. tostring(copyErr))
-    assert_true(not plugin.fileExists(testPngPath), "Live test PNG file should be safely deleted after transfer")
+    -- 7a. Asynchronous non-blocking copy test
+    local t0 = os.clock()
+    local copyOk, copyErr = plugin.copyImageToClipboard(testPngPath, { testPngPath }, true)
+    local elapsed = os.clock() - t0
+    assert_true(copyOk, "copyImageToClipboard async should succeed: " .. tostring(copyErr))
+    assert_true(elapsed < 1.5, string.format("Async clipboard execution must return quickly to avoid freezing UI (took %.3fs)", elapsed))
 
-    -- Test live copy with apostrophe / single-quote in path
+    -- Poll for background PowerShell cleanup (up to 12 wall-clock seconds)
+    local tPoll = os.time()
+    local asyncCleaned = false
+    while (os.time() - tPoll) < 12 do
+        if not plugin.fileExists(testPngPath) then
+            asyncCleaned = true
+            break
+        end
+        local tw = os.clock()
+        while (os.clock() - tw) < 0.2 do end
+    end
+    assert_true(asyncCleaned, "Async background process must automatically clean up the image file")
+
+    -- 7b. Synchronous copy test with apostrophe path (backwards compatibility)
     local testAposPath = tempDir .. sep .. "live_clip_O'Connor_test_" .. tostring(os.time()) .. ".png"
     local fp2 = io.open(testAposPath, "wb")
     fp2:write(pngBytes)
     fp2:close()
     assert_true(plugin.fileExists(testAposPath), "Live apostrophe test PNG should be created")
-    local copyAposOk, copyAposErr = plugin.copyImageToClipboard(testAposPath, { testAposPath })
-    assert_true(copyAposOk, "copyImageToClipboard with apostrophe path should execute successfully: " .. tostring(copyAposErr))
-    assert_true(not plugin.fileExists(testAposPath), "Live apostrophe test PNG should be safely deleted after transfer")
+    local copyAposOk, copyAposErr = plugin.copyImageToClipboard(testAposPath, { testAposPath }, false)
+    assert_true(copyAposOk, "copyImageToClipboard sync with apostrophe path should execute successfully: " .. tostring(copyAposErr))
+    assert_true(not plugin.fileExists(testAposPath), "Live apostrophe test PNG should be safely deleted immediately in sync mode")
 
-    print("  PASSED: Live Windows PowerShell/.NET clipboard copy and cleanup succeeded (standard and apostrophe paths).")
+    print("  PASSED: Live Windows PowerShell/.NET clipboard copy and cleanup succeeded (async and sync paths).")
 end
+
+--------------------------------------------------------------------------------
+-- 8. Quality Settings Input Dialog & Custom Value Validation
+--------------------------------------------------------------------------------
+print("\n[Test 8] Verifying Quality Settings input parsing, validation, and dialog...")
+
+-- 8a. Parse structured dialog outputs
+local resDpi = plugin.parseQualityInput("MODE=dpi;VALUE=450")
+assert_true(resDpi ~= nil, "parseQualityInput should parse MODE=dpi;VALUE=450")
+assert_eq(resDpi.mode, "dpi", "Parsed mode should be dpi")
+assert_eq(resDpi.value, 450, "Parsed value should be 450")
+
+local resWidth = plugin.parseQualityInput("MODE=width;VALUE=2560")
+assert_true(resWidth ~= nil, "parseQualityInput should parse MODE=width;VALUE=2560")
+assert_eq(resWidth.mode, "width", "Parsed mode should be width")
+assert_eq(resWidth.value, 2560, "Parsed value should be 2560")
+
+-- 8b. Parse pipe format (e.g. Zenity)
+local resZen1 = plugin.parseQualityInput("DPI|600")
+assert_eq(resZen1.mode, "dpi", "Zenity DPI format should parse as dpi")
+assert_eq(resZen1.value, 600, "Zenity DPI format value should be 600")
+
+local resZen2 = plugin.parseQualityInput("Fixed Width|3840")
+assert_eq(resZen2.mode, "width", "Zenity Width format should parse as width")
+assert_eq(resZen2.value, 3840, "Zenity Width format value should be 3840")
+
+-- 8c. Parse natural strings with units
+local resNat1 = plugin.parseQualityInput("500 dpi")
+assert_eq(resNat1.mode, "dpi", "500 dpi should parse as dpi")
+assert_eq(resNat1.value, 500, "500 dpi value should be 500")
+
+local resNat2 = plugin.parseQualityInput("2560 px")
+assert_eq(resNat2.mode, "width", "2560 px should parse as width")
+assert_eq(resNat2.value, 2560, "2560 px value should be 2560")
+
+local resNat3 = plugin.parseQualityInput("width 1440")
+assert_eq(resNat3.mode, "width", "width 1440 should parse as width")
+assert_eq(resNat3.value, 1440, "width 1440 value should be 1440")
+
+local resNat4 = plugin.parseQualityInput("1280w")
+assert_eq(resNat4.mode, "width", "1280w should parse as width")
+assert_eq(resNat4.value, 1280, "1280w value should be 1280")
+
+-- 8d. Parse plain numbers using default mode
+local resNum1 = plugin.parseQualityInput("400", "dpi")
+assert_eq(resNum1.mode, "dpi", "400 with default mode dpi should be dpi")
+assert_eq(resNum1.value, 400, "400 with default mode dpi value should be 400")
+
+local resNum2 = plugin.parseQualityInput("1920", "width")
+assert_eq(resNum2.mode, "width", "1920 with default mode width should be width")
+assert_eq(resNum2.value, 1920, "1920 with default mode width value should be 1920")
+
+-- 8e. Boundary validations
+-- Valid boundaries: DPI 50 and 2400
+local bDpiMin = plugin.parseQualityInput("MODE=dpi;VALUE=50")
+assert_true(bDpiMin ~= nil, "50 DPI should be valid minimum")
+local bDpiMax = plugin.parseQualityInput("MODE=dpi;VALUE=2400")
+assert_true(bDpiMax ~= nil, "2400 DPI should be valid maximum")
+
+-- Valid boundaries: Width 100 and 10000
+local bWMin = plugin.parseQualityInput("MODE=width;VALUE=100")
+assert_true(bWMin ~= nil, "100 px should be valid minimum width")
+local bWMax = plugin.parseQualityInput("MODE=width;VALUE=10000")
+assert_true(bWMax ~= nil, "10000 px should be valid maximum width")
+
+-- Out-of-bounds rejected
+local bDpiLow, errDpiLow = plugin.parseQualityInput("MODE=dpi;VALUE=49")
+assert_true(bDpiLow == nil, "49 DPI should be rejected")
+assert_true(errDpiLow:find("out of valid range") ~= nil, "Error should explain range")
+
+local bDpiHigh, errDpiHigh = plugin.parseQualityInput("MODE=dpi;VALUE=2401")
+assert_true(bDpiHigh == nil, "2401 DPI should be rejected")
+
+local bWLow, errWLow = plugin.parseQualityInput("MODE=width;VALUE=99")
+assert_true(bWLow == nil, "99 px width should be rejected")
+
+local bWHigh, errWHigh = plugin.parseQualityInput("MODE=width;VALUE=10001")
+assert_true(bWHigh == nil, "10001 px width should be rejected")
+
+-- Invalid strings and cancellation
+local inv1 = plugin.parseQualityInput("invalid_text")
+assert_true(inv1 == nil, "Invalid non-numeric text should be rejected")
+
+local inv2 = plugin.parseQualityInput("")
+assert_true(inv2 == nil, "Empty text should be rejected")
+
+local invCancel = plugin.parseQualityInput("CANCEL")
+assert_true(invCancel == nil, "CANCEL should return nil")
+
+-- 8f. Test applyQualitySettings and configureQuality persistence
+local testCfgPath = tempDir .. sep .. "test_dialog_config_" .. tostring(os.time()) .. ".ini"
+plugin.customConfigPath = testCfgPath
+
+local confOk, confMsg = plugin.configureQuality("MODE=width;VALUE=2880")
+assert_true(confOk, "configureQuality with custom width should succeed: " .. tostring(confMsg))
+assert_eq(plugin.config.mode, "width", "Active mode should be width")
+assert_eq(plugin.config.width, 2880, "Active width should be 2880")
+
+local reloaded = plugin.loadConfig(testCfgPath)
+assert_eq(reloaded.mode, "width", "Config on disk should persist mode=width")
+assert_eq(reloaded.width, 2880, "Config on disk should persist width=2880")
+
+-- Configure with custom DPI
+local confOk2 = plugin.configureQuality("450 dpi")
+assert_true(confOk2, "configureQuality with 450 dpi should succeed")
+assert_eq(plugin.config.mode, "dpi", "Active mode should be dpi")
+assert_eq(plugin.config.dpi, 450, "Active dpi should be 450")
+
+local reloaded2 = plugin.loadConfig(testCfgPath)
+assert_eq(reloaded2.mode, "dpi", "Config on disk should persist mode=dpi")
+assert_eq(reloaded2.dpi, 450, "Config on disk should persist dpi=450")
+
+-- Cancel action leaves config intact
+local confCancel = plugin.configureQuality("CANCEL")
+assert_true(not confCancel, "CANCEL should return false")
+assert_eq(plugin.config.dpi, 450, "Config dpi should remain unchanged after cancel")
+
+-- Cleanup test config file
+os.remove(testCfgPath)
+plugin.customConfigPath = nil
+
+-- 8g. Test OS Dialog command formation
+local winDlgCmd = plugin.getWindowsDialogCommand()
+assert_true(winDlgCmd:find("powershell%.exe"), "Windows dialog command must invoke powershell")
+assert_true(winDlgCmd:find("System%.Windows%.Forms"), "Windows dialog command must load System.Windows.Forms")
+assert_true(winDlgCmd:find("Copy Quality Settings"), "Windows dialog command must set title")
+assert_true(winDlgCmd:find("RadioButton"), "Windows dialog command must include RadioButtons")
+assert_true(winDlgCmd:find("TextBox"), "Windows dialog command must include TextBox")
+
+local linuxDlgCmd = plugin.getLinuxDialogCommand()
+assert_true(linuxDlgCmd:find("zenity") ~= nil, "Linux dialog command must check zenity")
+assert_true(linuxDlgCmd:find("kdialog") ~= nil, "Linux dialog command must check kdialog")
+
+local macDlgCmd = plugin.getMacDialogCommand()
+assert_true(macDlgCmd:find("osascript") ~= nil, "macOS dialog command must invoke osascript")
+assert_true(macDlgCmd:find("display dialog") ~= nil, "macOS dialog command must use display dialog")
+
+local osDlgCmd = plugin.getDialogCommand()
+assert_true(osDlgCmd ~= nil and #osDlgCmd > 0, "getDialogCommand must return non-empty command")
+
+print("  PASSED: Quality Settings dialog, input parsing, boundaries, and persistence verified.")
 
 print("\n======================================================================")
 print(string.format("All tests completed: %d assertions passed, %d failed.", testsPassed, testsFailed))

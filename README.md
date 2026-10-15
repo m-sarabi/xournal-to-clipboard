@@ -12,16 +12,17 @@ A production-ready Xournal++ Lua plugin that enables copying the currently activ
 
 ## Features
 
-- ⚡ **Instant One-Key Copy**: Press `<Control><Alt>c` to capture the currently viewed page directly into your clipboard.
-- 🖼️ **Dual Quality Modes**:
-  - **DPI Mode** (Default: 300 DPI, with 150 / 300 / 600 presets)
-  - **Fixed Width Mode** (Default: 1920 px, with 1280 / 1920 / 2560 / 3840 presets)
+- ⚡ **Instant Non-Blocking Copy**: Press `<Control><Alt>c` to capture the currently viewed page directly into your clipboard. Clipboard encoding and cleanup run asynchronously in the background so Xournal++ never freezes or lags regardless of image size.
+- 🖼️ **Dual Quality Modes & Custom Values**:
+  - **DPI Mode** (Default: 300 DPI, supports any custom resolution from 50 to 2400 DPI)
+  - **Fixed Width Mode** (Default: 1920 px, supports any custom width from 100 to 10000 px)
+- 🎛️ **Clean Unified Dialog**: Replaces cluttered preset menu items with a single intuitive dialog for selecting mode and custom resolution.
 - 💾 **Settings Persistence**: Remembers your preferred mode and quality settings across Xournal++ restarts in `config.ini`.
 - 🌐 **Cross-Platform Clipboard Integration**:
-  - **Windows**: Native PowerShell & .NET Clipboard API (`System.Windows.Forms.Clipboard`).
-  - **Linux**: Wayland (`wl-copy`) and X11 (`xclip` / `xsel`) support.
-  - **macOS**: Native `osascript` (`«class PNGf»`).
-- 🧹 **Zero Disk Clutter**: Temporary export images are safely and cleanly removed immediately after being transferred to clipboard memory.
+  - **Windows**: Native background PowerShell & .NET Clipboard API (`System.Windows.Forms.Clipboard`).
+  - **Linux**: Wayland (`wl-copy`) and X11 (`xclip` / `xsel`) background subshell.
+  - **macOS**: Native background `osascript` (`«class PNGf»`).
+- 🧹 **Zero Disk Clutter**: Temporary export images are safely and cleanly removed by the background process immediately after being transferred to clipboard memory.
 - 🔔 **Visual Feedback**: Displays brief status notifications on successful copy or configuration changes.
 
 ---
@@ -100,18 +101,16 @@ git clone https://github.com/m-sarabi/xournal-to-clipboard.git ~/Library/Applica
 1. Open or create any notebook file in Xournal++.
 2. Draw or write some strokes on the current page.
 3. Press **`<Control><Alt>c`** (or click **Plugin > Copy Current Page to Clipboard** from the menu).
-4. A notification will appear confirming: `Page 1 copied to clipboard (300 DPI)!`.
+4. A notification will appear confirming: `Page 1 copied to clipboard (300 DPI)!`. The clipboard transfer executes smoothly in the background without causing the interface to hang or stutter.
 5. Open any application that supports image pasting (such as Slack, Discord, Microsoft Word, Obsidian, WhatsApp, or an image editor like GIMP / Paint) and press **`Ctrl+V`** (`Cmd+V` on macOS).
 6. Verify the high-resolution PNG image is pasted into the target application.
 
 ### 3. Configure Image Quality Settings
-Under the **Plugin** menu, you can configure quality on the fly:
-- **Quality: DPI Mode (300 DPI)**: Switch to DPI rendering at 300 DPI.
-- **Quality: Fixed Width Mode (1920 px)**: Switch to fixed horizontal pixel width.
-- **Quality: Toggle Mode (DPI / Width)**: Quickly toggle between DPI and Width mode.
-- **Quality: Cycle DPI (150 -> 300 -> 600)**: Cycle through common DPI presets.
-- **Quality: Cycle Width (1280 -> 1920 -> 2560)**: Cycle through common width presets.
-- **Quality: Show Current Settings**: Display current active configuration and config path.
+Under the **Plugin** menu, you can configure quality at any time:
+- Click **Plugin > Quality Settings...** to open the unified configuration dialog.
+- Select your preferred mode: **DPI** or **Fixed Width (pixels)**.
+- Enter any custom value (e.g. `450` for 450 DPI, or `2560` for 2560 px width).
+- Click **OK** to apply.
 
 All preferences are automatically persisted in `config.ini` in the plugin directory across sessions.
 
@@ -124,8 +123,8 @@ You can also customize settings by editing `config.ini` directly:
 ```ini
 [settings]
 mode=dpi      # Quality mode: "dpi" or "width"
-dpi=300       # Resolution in DPI (default: 300, recommended: 150, 300, 600)
-width=1920    # Pixel width for fixed width mode (default: 1920)
+dpi=300       # Resolution in DPI (default: 300, valid: 50 - 2400)
+width=1920    # Pixel width for fixed width mode (default: 1920, valid: 100 - 10000)
 ```
 
 ---

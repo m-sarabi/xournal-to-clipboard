@@ -247,81 +247,194 @@ function CopyPagePlugin.shellEscape(str)
     return "'" .. tostring(str):gsub("'", "'\\''") .. "'"
 end
 
+--- Format a list of file paths into a PowerShell string array literal @('p1', 'p2').
+-- @param files table array of file paths
+-- @return string PowerShell array expression
+function CopyPagePlugin.formatFilesForPowerShell(files)
+    local items = {}
+    for _, f in ipairs(files or {}) do
+        if f and f ~= "" then
+            local norm = f:gsub("\\", "/"):gsub("'", "''")
+            table.insert(items, string.format("'%s'", norm))
+        end
+    end
+    if #items == 0 then
+        return "@()"
+    end
+    return "@(" .. table.concat(items, ", ") .. ")"
+end
+
+--- Format a list of file paths for POSIX shell command arguments.
+-- @param files table array of file paths
+-- @return string space-separated escaped file paths
+function CopyPagePlugin.formatFilesForPosix(files)
+    local items = {}
+    for _, f in ipairs(files or {}) do
+        if f and f ~= "" then
+            table.insert(items, CopyPagePlugin.shellEscape(f))
+        end
+    end
+    return table.concat(items, " ")
+end
+
 --- Build Windows PowerShell clipboard command using .NET Clipboard API.
 -- @param imagePath string absolute path to the PNG image
+-- @param filesToClean table optional list of files to safely delete in finally block
+-- @param isAsync boolean optional flag to launch in background without blocking UI
 -- @return string execution command
-function CopyPagePlugin.getWindowsClipboardCommand(imagePath)
+function CopyPagePlugin.getWindowsClipboardCommand(imagePath, filesToClean, isAsync)
     -- Normalize backslashes to forward slashes for clean PowerShell string literal handling
     local normalized = imagePath:gsub("\\", "/")
     -- Escape single quotes for PowerShell single-quoted string literal (' -> '')
     local escaped = normalized:gsub("'", "''")
-    return string.format(
-        'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' ..
+
+    local cleanupSnippet = ""
+    if isAsync and filesToClean and #filesToClean > 0 then
+        local cleanList = CopyPagePlugin.formatFilesForPowerShell(filesToClean)
+        cleanupSnippet = string.format("; Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue", cleanList)
+    end
+
+    local psCore = string.format(
         '$img = $null; try { ' ..
         'Add-Type -AssemblyName System.Windows.Forms; ' ..
         'Add-Type -AssemblyName System.Drawing; ' ..
         '$img = [System.Drawing.Image]::FromFile(\'%s\'); ' ..
         '[System.Windows.Forms.Clipboard]::SetDataObject($img, $true, 10, 100); ' ..
         '} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 } ' ..
-        'finally { if ($null -ne $img) { $img.Dispose() } }"',
-        escaped
+        'finally { if ($null -ne $img) { $img.Dispose() }%s }',
+        escaped,
+        cleanupSnippet
     )
+
+    local baseCmd = string.format(
+        'powershell.exe -Sta -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "%s"',
+        psCore
+    )
+
+    if isAsync then
+        return 'start "" /B ' .. baseCmd
+    else
+        return baseCmd
+    end
 end
 
 --- Build Linux Wayland clipboard command.
 -- @param imagePath string absolute path to the PNG image
+-- @param filesToClean table optional list of files to remove afterwards
+-- @param isAsync boolean optional flag for background execution
 -- @return string execution command
-function CopyPagePlugin.getLinuxWaylandCommand(imagePath)
-    return string.format('wl-copy -t image/png < %s', CopyPagePlugin.shellEscape(imagePath))
+function CopyPagePlugin.getLinuxWaylandCommand(imagePath, filesToClean, isAsync)
+    local q = CopyPagePlugin.shellEscape(imagePath)
+    local cleanupSnippet = ""
+    if isAsync and filesToClean and #filesToClean > 0 then
+        local cleanList = CopyPagePlugin.formatFilesForPosix(filesToClean)
+        if cleanList ~= "" then
+            cleanupSnippet = " ; rm -f " .. cleanList
+        end
+    end
+    local base = string.format('wl-copy -t image/png < %s%s', q, cleanupSnippet)
+    if isAsync then
+        return string.format('( %s ) >/dev/null 2>&1 &', base)
+    else
+        return base
+    end
 end
 
 --- Build Linux X11 clipboard command.
 -- @param imagePath string absolute path to the PNG image
+-- @param filesToClean table optional list of files to remove afterwards
+-- @param isAsync boolean optional flag for background execution
 -- @return string execution command
-function CopyPagePlugin.getLinuxX11Command(imagePath)
-    return string.format('xclip -selection clipboard -t image/png -i %s', CopyPagePlugin.shellEscape(imagePath))
+function CopyPagePlugin.getLinuxX11Command(imagePath, filesToClean, isAsync)
+    local q = CopyPagePlugin.shellEscape(imagePath)
+    local cleanupSnippet = ""
+    if isAsync and filesToClean and #filesToClean > 0 then
+        local cleanList = CopyPagePlugin.formatFilesForPosix(filesToClean)
+        if cleanList ~= "" then
+            cleanupSnippet = " ; rm -f " .. cleanList
+        end
+    end
+    local base = string.format('xclip -selection clipboard -t image/png -i %s%s', q, cleanupSnippet)
+    if isAsync then
+        return string.format('( %s ) >/dev/null 2>&1 &', base)
+    else
+        return base
+    end
 end
 
 --- Build Linux universal clipboard command with Wayland (wl-copy) and X11 (xclip / xsel) fallback.
 -- @param imagePath string absolute path to the PNG image
+-- @param filesToClean table optional list of files to remove afterwards
+-- @param isAsync boolean optional flag for background execution
 -- @return string execution command
-function CopyPagePlugin.getLinuxCommand(imagePath)
+function CopyPagePlugin.getLinuxCommand(imagePath, filesToClean, isAsync)
     local q = CopyPagePlugin.shellEscape(imagePath)
-    return string.format(
+    local cleanupSnippet = ""
+    if isAsync and filesToClean and #filesToClean > 0 then
+        local cleanList = CopyPagePlugin.formatFilesForPosix(filesToClean)
+        if cleanList ~= "" then
+            cleanupSnippet = " ; rm -f " .. cleanList
+        end
+    end
+
+    local base = string.format(
         'if command -v wl-copy >/dev/null 2>&1; then ' ..
         'wl-copy -t image/png < %s; ' ..
         'elif command -v xclip >/dev/null 2>&1; then ' ..
         'xclip -selection clipboard -t image/png -i %s; ' ..
         'elif command -v xsel >/dev/null 2>&1; then ' ..
         'xsel -b -i < %s; ' ..
-        'else exit 127; fi',
-        q, q, q
+        'else exit 127; fi%s',
+        q, q, q, cleanupSnippet
     )
+
+    if isAsync then
+        return string.format('( %s ) >/dev/null 2>&1 &', base)
+    else
+        return base
+    end
 end
 
 --- Build macOS osascript clipboard command using native PNG class.
 -- @param imagePath string absolute path to the PNG image
+-- @param filesToClean table optional list of files to remove afterwards
+-- @param isAsync boolean optional flag for background execution
 -- @return string execution command
-function CopyPagePlugin.getMacClipboardCommand(imagePath)
+function CopyPagePlugin.getMacClipboardCommand(imagePath, filesToClean, isAsync)
     -- Escape backslashes and double quotes for AppleScript string literal
     local asEscaped = tostring(imagePath):gsub("\\", "\\\\"):gsub('"', '\\"')
     local script = string.format('set the clipboard to (read (POSIX file "%s") as «class PNGf»)', asEscaped)
-    -- Escape single quotes for shell argument
-    return string.format("osascript -e '%s'", script:gsub("'", "'\\''"))
+    local osaCmd = string.format("osascript -e '%s'", script:gsub("'", "'\\''"))
+
+    local cleanupSnippet = ""
+    if isAsync and filesToClean and #filesToClean > 0 then
+        local cleanList = CopyPagePlugin.formatFilesForPosix(filesToClean)
+        if cleanList ~= "" then
+            cleanupSnippet = " ; rm -f " .. cleanList
+        end
+    end
+
+    if isAsync then
+        return string.format('( %s%s ) >/dev/null 2>&1 &', osaCmd, cleanupSnippet)
+    else
+        return osaCmd
+    end
 end
 
 --- Form clipboard copy command for the specified or detected OS.
 -- @param imagePath string path to the image
 -- @param osName string optional OS name override
+-- @param filesToClean table optional list of files to clean up
+-- @param isAsync boolean optional flag for background execution
 -- @return string command string
-function CopyPagePlugin.getClipboardCommand(imagePath, osName)
+function CopyPagePlugin.getClipboardCommand(imagePath, osName, filesToClean, isAsync)
     local targetOS = osName or CopyPagePlugin.detectOS()
     if targetOS == "windows" then
-        return CopyPagePlugin.getWindowsClipboardCommand(imagePath)
+        return CopyPagePlugin.getWindowsClipboardCommand(imagePath, filesToClean, isAsync)
     elseif targetOS == "macos" then
-        return CopyPagePlugin.getMacClipboardCommand(imagePath)
+        return CopyPagePlugin.getMacClipboardCommand(imagePath, filesToClean, isAsync)
     else
-        return CopyPagePlugin.getLinuxCommand(imagePath)
+        return CopyPagePlugin.getLinuxCommand(imagePath, filesToClean, isAsync)
     end
 end
 
@@ -654,10 +767,13 @@ end
 --- Execute clipboard copy and clean up temporary files.
 -- @param imagePath string absolute path to verified image file
 -- @param filesToClean table list of file paths to remove afterwards
+-- @param isAsync boolean optional flag to execute in background (default true)
 -- @return boolean success, string or nil error message
-function CopyPagePlugin.copyImageToClipboard(imagePath, filesToClean)
+function CopyPagePlugin.copyImageToClipboard(imagePath, filesToClean, isAsync)
     local osType = CopyPagePlugin.detectOS()
-    local cmd = CopyPagePlugin.getClipboardCommand(imagePath, osType)
+    -- Default to asynchronous execution (isAsync ~= false) to prevent UI freezing
+    local async = (isAsync ~= false)
+    local cmd = CopyPagePlugin.getClipboardCommand(imagePath, osType, filesToClean, async)
 
     local execStatus, execKind, execCode = os.execute(cmd)
 
@@ -665,8 +781,15 @@ function CopyPagePlugin.copyImageToClipboard(imagePath, filesToClean)
     -- In Lua 5.1/LuaJIT, it returns status code 0 on success.
     local success = (execStatus == true or execStatus == 0)
 
-    -- Clean up temporary files immediately after clipboard transfer
-    CopyPagePlugin.cleanupFiles(filesToClean)
+    -- If synchronous execution was requested, perform cleanup now
+    if not async then
+        CopyPagePlugin.cleanupFiles(filesToClean)
+    else
+        -- If background launch itself failed, clean up immediately
+        if not success then
+            CopyPagePlugin.cleanupFiles(filesToClean)
+        end
+    end
 
     if success then
         return true, nil
@@ -698,7 +821,8 @@ function CopyPagePlugin.copyCurrentPage()
     -- Add the actual found file to cleanup list
     table.insert(filesToClean, exportedFile)
 
-    local ok, clipErr = CopyPagePlugin.copyImageToClipboard(exportedFile, filesToClean)
+    -- Run clipboard operation asynchronously in the background to keep the UI completely responsive
+    local ok, clipErr = CopyPagePlugin.copyImageToClipboard(exportedFile, filesToClean, true)
     if ok then
         local qualityStr = (CopyPagePlugin.config.mode == "width")
             and (tostring(CopyPagePlugin.config.width) .. "px width")
@@ -712,7 +836,7 @@ function CopyPagePlugin.copyCurrentPage()
 end
 
 --------------------------------------------------------------------------------
--- 6. Quality Configuration Actions
+-- 6. Quality Configuration & Input Dialog
 --------------------------------------------------------------------------------
 
 --- Set quality mode to DPI and persist.
@@ -799,6 +923,341 @@ function CopyPagePlugin.showSettings()
     ))
 end
 
+--- Build Windows PowerShell dialog command.
+-- Displays a WinForms dialog allowing user to choose mode and enter custom value.
+-- @param currentConfig table current active config
+-- @return string execution command
+function CopyPagePlugin.getWindowsDialogCommand(currentConfig)
+    local cfg = currentConfig or CopyPagePlugin.config
+    local isWidth = (cfg.mode == "width")
+    local initVal = isWidth and tostring(cfg.width or 1920) or tostring(cfg.dpi or 300)
+    local dpiChecked = isWidth and "$false" or "$true"
+    local widthChecked = isWidth and "$true" or "$false"
+
+    local ps = string.format(
+        'Add-Type -AssemblyName System.Windows.Forms; ' ..
+        'Add-Type -AssemblyName System.Drawing; ' ..
+        '$f = New-Object System.Windows.Forms.Form; ' ..
+        '$f.Text = \'Copy Quality Settings\'; ' ..
+        '$f.Size = New-Object System.Drawing.Size(320, 230); ' ..
+        '$f.StartPosition = \'CenterScreen\'; ' ..
+        '$f.FormBorderStyle = \'FixedDialog\'; ' ..
+        '$f.MaximizeBox = $false; $f.MinimizeBox = $false; ' ..
+        '$lbl = New-Object System.Windows.Forms.Label; ' ..
+        '$lbl.Text = \'Select Quality Mode:\'; ' ..
+        '$lbl.Location = New-Object System.Drawing.Point(20, 15); ' ..
+        '$lbl.Size = New-Object System.Drawing.Size(260, 20); ' ..
+        '$f.Controls.Add($lbl); ' ..
+        '$rbDpi = New-Object System.Windows.Forms.RadioButton; ' ..
+        '$rbDpi.Text = \'DPI (dots/in)\'; ' ..
+        '$rbDpi.Location = New-Object System.Drawing.Point(30, 40); ' ..
+        '$rbDpi.Size = New-Object System.Drawing.Size(110, 22); ' ..
+        '$rbDpi.Checked = %s; ' ..
+        '$f.Controls.Add($rbDpi); ' ..
+        '$rbW = New-Object System.Windows.Forms.RadioButton; ' ..
+        '$rbW.Text = \'Width (pixels)\'; ' ..
+        '$rbW.Location = New-Object System.Drawing.Point(150, 40); ' ..
+        '$rbW.Size = New-Object System.Drawing.Size(120, 22); ' ..
+        '$rbW.Checked = %s; ' ..
+        '$f.Controls.Add($rbW); ' ..
+        '$lblVal = New-Object System.Windows.Forms.Label; ' ..
+        '$lblVal.Text = \'Enter Value (DPI: 50-2400, Width: 100-10000):\'; ' ..
+        '$lblVal.Location = New-Object System.Drawing.Point(20, 72); ' ..
+        '$lblVal.Size = New-Object System.Drawing.Size(270, 20); ' ..
+        '$f.Controls.Add($lblVal); ' ..
+        '$txt = New-Object System.Windows.Forms.TextBox; ' ..
+        '$txt.Text = \'%s\'; ' ..
+        '$txt.Location = New-Object System.Drawing.Point(20, 95); ' ..
+        '$txt.Size = New-Object System.Drawing.Size(260, 24); ' ..
+        '$f.Controls.Add($txt); ' ..
+        '$btnOk = New-Object System.Windows.Forms.Button; ' ..
+        '$btnOk.Text = \'OK\'; ' ..
+        '$btnOk.Location = New-Object System.Drawing.Point(50, 140); ' ..
+        '$btnOk.Size = New-Object System.Drawing.Size(90, 30); ' ..
+        '$btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK; ' ..
+        '$f.AcceptButton = $btnOk; ' ..
+        '$f.Controls.Add($btnOk); ' ..
+        '$btnCan = New-Object System.Windows.Forms.Button; ' ..
+        '$btnCan.Text = \'Cancel\'; ' ..
+        '$btnCan.Location = New-Object System.Drawing.Point(160, 140); ' ..
+        '$btnCan.Size = New-Object System.Drawing.Size(90, 30); ' ..
+        '$btnCan.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; ' ..
+        '$f.CancelButton = $btnCan; ' ..
+        '$f.Controls.Add($btnCan); ' ..
+        '$f.TopMost = $true; ' ..
+        '$res = $f.ShowDialog(); ' ..
+        'if ($res -eq [System.Windows.Forms.DialogResult]::OK) { ' ..
+        '$m = if ($rbW.Checked) { \'width\' } else { \'dpi\' }; ' ..
+        'Write-Output \"MODE=$m;VALUE=$($txt.Text.Trim())\"; ' ..
+        '} else { Write-Output \'CANCEL\'; }',
+        dpiChecked, widthChecked, initVal
+    )
+
+    return string.format(
+        'powershell.exe -Sta -NoProfile -ExecutionPolicy Bypass -Command "%s"',
+        ps
+    )
+end
+
+--- Build Linux dialog command using zenity or kdialog.
+-- @param currentConfig table current active config
+-- @return string execution command
+function CopyPagePlugin.getLinuxDialogCommand(currentConfig)
+    local cfg = currentConfig or CopyPagePlugin.config
+    local isWidth = (cfg.mode == "width")
+    local initVal = isWidth and tostring(cfg.width or 1920) or tostring(cfg.dpi or 300)
+    local comboValues = isWidth and "Fixed Width|DPI" or "DPI|Fixed Width"
+
+    return string.format(
+        'if command -v zenity >/dev/null 2>&1; then ' ..
+        'zenity --forms --title="Copy Quality Settings" --text="Configure CopyPageToClipboard Settings" ' ..
+        '--add-combo="Mode" --combo-values="%s" --add-entry="Value (e.g. 300 for DPI, 1920 for Width)" 2>/dev/null; ' ..
+        'elif command -v kdialog >/dev/null 2>&1; then ' ..
+        'kdialog --title "Copy Quality Settings" --inputbox "Enter Quality (e.g. 300 dpi or 1920 px):" "%s" 2>/dev/null; ' ..
+        'else echo "CANCEL"; fi',
+        comboValues, initVal
+    )
+end
+
+--- Build macOS AppleScript dialog command.
+-- @param currentConfig table current active config
+-- @return string execution command
+function CopyPagePlugin.getMacDialogCommand(currentConfig)
+    local cfg = currentConfig or CopyPagePlugin.config
+    local isWidth = (cfg.mode == "width")
+    local defaultText = isWidth and string.format("%d px", cfg.width or 1920) or string.format("%d dpi", cfg.dpi or 300)
+
+    local script = string.format(
+        'try\n' ..
+        '  set res to (display dialog "Enter Quality Setting (e.g. 300 dpi or 1920 px):" default answer "%s" with title "Copy Quality Settings" buttons {"Cancel", "OK"} default button "OK")\n' ..
+        '  text returned of res\n' ..
+        'on error number -128\n' ..
+        '  "CANCEL"\n' ..
+        'end try',
+        defaultText
+    )
+
+    return string.format("osascript -e '%s'", script:gsub("'", "'\\''"))
+end
+
+--- Resolve the dialog command for the current or specified OS.
+-- @param osName string optional OS name override
+-- @param currentConfig table optional config table
+-- @return string execution command
+function CopyPagePlugin.getDialogCommand(osName, currentConfig)
+    local targetOS = osName or CopyPagePlugin.detectOS()
+    if targetOS == "windows" then
+        return CopyPagePlugin.getWindowsDialogCommand(currentConfig)
+    elseif targetOS == "macos" then
+        return CopyPagePlugin.getMacDialogCommand(currentConfig)
+    else
+        return CopyPagePlugin.getLinuxDialogCommand(currentConfig)
+    end
+end
+
+--- Prompt the user for quality settings via GUI dialog.
+-- Checks:
+-- 1. dialogPromptOverride / mockDialogInput (useful for testing or automation)
+-- 2. Native GTK3 dialog via Lua lgi (if embedded within Xournal++ GTK environment)
+-- 3. Native host OS dialog (PowerShell WinForms on Windows, zenity on Linux, osascript on macOS)
+-- @return string or nil raw response from user or dialog
+function CopyPagePlugin.promptQualityDialog()
+    if type(CopyPagePlugin.dialogPromptOverride) == "function" then
+        return CopyPagePlugin.dialogPromptOverride()
+    end
+    if CopyPagePlugin.mockDialogInput ~= nil then
+        return CopyPagePlugin.mockDialogInput
+    end
+
+    -- 1. Try GTK3 Dialog via lgi if available in Xournal++
+    local okLgi, lgi = pcall(require, "lgi")
+    if okLgi and lgi then
+        local okGtk, Gtk = pcall(lgi.require, "Gtk", "3.0")
+        if okGtk and Gtk and Gtk.Dialog then
+            local isWidth = (CopyPagePlugin.config.mode == "width")
+            local initVal = isWidth and tostring(CopyPagePlugin.config.width or 1920) or tostring(CopyPagePlugin.config.dpi or 300)
+
+            local dlg = Gtk.Dialog({
+                title = "Copy Quality Settings",
+                modal = true,
+                destroy_with_parent = true
+            })
+            dlg:add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dlg:add_button("OK", Gtk.ResponseType.OK)
+
+            local content = dlg:get_content_area()
+            content:set_spacing(8)
+            content:set_border_width(12)
+
+            local lblMode = Gtk.Label({ label = "<b>Quality Mode:</b>", use_markup = true, xalign = 0 })
+            content:add(lblMode)
+
+            local rbDpi = Gtk.RadioButton({ label = "DPI (dots per inch)", active = not isWidth })
+            local rbWidth = Gtk.RadioButton({ label = "Fixed Width (pixels)", group = rbDpi, active = isWidth })
+            content:add(rbDpi)
+            content:add(rbWidth)
+
+            local lblVal = Gtk.Label({ label = "<b>Value (DPI: 50-2400, Width: 100-10000):</b>", use_markup = true, xalign = 0 })
+            content:add(lblVal)
+
+            local entry = Gtk.Entry({ text = initVal })
+            content:add(entry)
+
+            dlg:show_all()
+            local response = dlg:run()
+            local chosenMode = rbWidth:get_active() and "width" or "dpi"
+            local textVal = entry:get_text() or ""
+            dlg:destroy()
+
+            if response == Gtk.ResponseType.OK then
+                return string.format("MODE=%s;VALUE=%s", chosenMode, textVal)
+            else
+                return "CANCEL"
+            end
+        end
+    end
+
+    -- 2. Fallback to OS native GUI prompt via io.popen
+    local cmd = CopyPagePlugin.getDialogCommand()
+    local handle = io.popen(cmd)
+    if not handle then
+        return nil
+    end
+
+    local output = handle:read("*a") or ""
+    handle:close()
+
+    local trimmed = output:match("^%s*(.-)%s*$")
+    if trimmed == "" then
+        return "CANCEL"
+    end
+    return trimmed
+end
+
+--- Parse and validate raw user input from settings dialog or text prompt.
+-- Supports:
+-- - Structured format: "MODE=dpi;VALUE=450" or "MODE=width;VALUE=2560"
+-- - Pipe format: "DPI|300" or "Fixed Width|1920"
+-- - Natural format with units: "450 dpi", "2560 px", "width 1920", "1280w"
+-- - Pure numbers: "600", "2560" (uses defaultMode or current mode)
+-- @param inputStr string raw input string
+-- @param defaultMode string optional fallback mode ("dpi" or "width")
+-- @return table { mode = "dpi"|"width", value = number } or nil, string error message
+function CopyPagePlugin.parseQualityInput(inputStr, defaultMode)
+    if not inputStr or inputStr == "" then
+        return nil, "No input provided."
+    end
+
+    local raw = inputStr:match("^%s*(.-)%s*$")
+    if raw == "" or raw:upper() == "CANCEL" then
+        return nil, "Cancelled"
+    end
+
+    -- Check structured output: MODE=xxx;VALUE=yyy or MODE=xxx|VALUE=yyy
+    local sMode, sVal = raw:match("^[Mm][Oo][Dd][Ee]%s*[:=]%s*([%w_]+)%s*[;|]%s*[Vv][Aa][Ll][Uu][Ee]%s*[:=]%s*(.-)$")
+    if not sMode then
+        -- Check pipe-delimited format (e.g. from zenity --forms): "DPI|300" or "Fixed Width|1920"
+        local pMode, pVal = raw:match("^([^|]+)|([^|]+)$")
+        if pMode and pVal then
+            pMode = pMode:lower():gsub("%s+", "")
+            if pMode:find("width") or pMode:find("pixel") then
+                sMode = "width"
+            else
+                sMode = "dpi"
+            end
+            sVal = pVal
+        end
+    end
+
+    local mode = defaultMode or CopyPagePlugin.config.mode or "dpi"
+    local num = nil
+
+    if sMode and sVal then
+        local m = sMode:lower()
+        if m == "dpi" or m == "width" then
+            mode = m
+        end
+        num = tonumber(sVal:match("(%d+)"))
+    else
+        local lower = raw:lower()
+        if lower:find("width") or lower:find("px") or lower:find("pixel") or lower:match("%d+%s*w$") then
+            mode = "width"
+        elseif lower:find("dpi") or lower:find("dots") then
+            mode = "dpi"
+        end
+
+        local digits = lower:match("(%d+)")
+        if digits then
+            num = tonumber(digits)
+        end
+    end
+
+    if not num then
+        return nil, string.format("Invalid numeric value in '%s'.", raw)
+    end
+
+    if mode == "dpi" then
+        if num < 50 or num > 2400 then
+            return nil, string.format("DPI %d out of valid range (50 - 2400 DPI).", num)
+        end
+        return { mode = "dpi", value = num }, nil
+    else
+        if num < 100 or num > 10000 then
+            return nil, string.format("Width %d px out of valid range (100 - 10000 px).", num)
+        end
+        return { mode = "width", value = num }, nil
+    end
+end
+
+--- Apply and persist new quality settings.
+-- @param mode string "dpi" or "width"
+-- @param value number numeric setting
+-- @return boolean success, string message
+function CopyPagePlugin.applyQualitySettings(mode, value)
+    if mode == "width" then
+        CopyPagePlugin.config.mode = "width"
+        CopyPagePlugin.config.width = math.floor(value)
+    else
+        CopyPagePlugin.config.mode = "dpi"
+        CopyPagePlugin.config.dpi = math.floor(value)
+    end
+
+    local ok, err = CopyPagePlugin.saveConfig()
+    if ok then
+        local msg = (CopyPagePlugin.config.mode == "width")
+            and string.format("Quality settings updated: Fixed Width (%d px).", CopyPagePlugin.config.width)
+            or string.format("Quality settings updated: DPI (%d DPI).", CopyPagePlugin.config.dpi)
+        CopyPagePlugin.notify(msg, false)
+        return true, msg
+    else
+        local errMsg = "Failed to save configuration: " .. tostring(err)
+        CopyPagePlugin.notify(errMsg, true)
+        return false, errMsg
+    end
+end
+
+--- Open quality dialog, parse result, and update configuration.
+-- @param rawInput string optional direct input string (bypasses dialog GUI prompt)
+-- @return boolean success, string or nil message
+function CopyPagePlugin.configureQuality(rawInput)
+    local input = rawInput
+    if not input then
+        input = CopyPagePlugin.promptQualityDialog()
+    end
+
+    if not input or input == "CANCEL" or input == "" then
+        return false, "Operation cancelled by user."
+    end
+
+    local parsed, err = CopyPagePlugin.parseQualityInput(input, CopyPagePlugin.config.mode)
+    if not parsed then
+        CopyPagePlugin.notify("Invalid quality setting: " .. tostring(err), true)
+        return false, err
+    end
+
+    return CopyPagePlugin.applyQualitySettings(parsed.mode, parsed.value)
+end
+
 --------------------------------------------------------------------------------
 -- 7. Xournal++ Plugin Initialization & Global Callbacks
 --------------------------------------------------------------------------------
@@ -808,6 +1267,11 @@ function copyCurrentPage()
     return CopyPagePlugin.copyCurrentPage()
 end
 
+function actionConfigureQuality()
+    return CopyPagePlugin.configureQuality()
+end
+
+-- Backward compatibility actions
 function actionSetDpiMode()
     CopyPagePlugin.setQualityDpi(300)
 end
@@ -848,35 +1312,10 @@ function initUi()
         ["accelerator"] = "<Control><Alt>c"
     })
 
-    -- Quality configuration menu entries
+    -- Single clean quality settings menu entry replacing 6 cluttered preset options
     app.registerUi({
-        ["menu"] = "Quality: DPI Mode (300 DPI)",
-        ["callback"] = "actionSetDpiMode"
-    })
-
-    app.registerUi({
-        ["menu"] = "Quality: Fixed Width Mode (1920 px)",
-        ["callback"] = "actionSetWidthMode"
-    })
-
-    app.registerUi({
-        ["menu"] = "Quality: Toggle Mode (DPI / Width)",
-        ["callback"] = "actionToggleMode"
-    })
-
-    app.registerUi({
-        ["menu"] = "Quality: Cycle DPI (150 -> 300 -> 600)",
-        ["callback"] = "actionCycleDpi"
-    })
-
-    app.registerUi({
-        ["menu"] = "Quality: Cycle Width (1280 -> 1920 -> 2560)",
-        ["callback"] = "actionCycleWidth"
-    })
-
-    app.registerUi({
-        ["menu"] = "Quality: Show Current Settings",
-        ["callback"] = "actionShowSettings"
+        ["menu"] = "Quality Settings...",
+        ["callback"] = "actionConfigureQuality"
     })
 end
 

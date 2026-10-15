@@ -243,6 +243,130 @@ class TestCopyPageToClipboard(unittest.TestCase):
             if os.path.exists(tf_path):
                 os.remove(tf_path)
 
+    def test_async_clipboard_command_formation(self):
+        """Verify asynchronous clipboard commands include background execution and cleanup."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local p = require("main"); '
+            'local files = { "/tmp/a.png", "/tmp/b.png" }; '
+            'local wc = p.getWindowsClipboardCommand("C:\\\\a.png", { "C:\\\\a.png", "C:\\\\b.png" }, true); '
+            'local lc = p.getLinuxCommand("/tmp/a.png", files, true); '
+            'local mc = p.getMacClipboardCommand("/tmp/a.png", files, true); '
+            'assert(wc:find("start"), "Windows async must have start"); '
+            'assert(wc:find("/B"), "Windows async must have /B"); '
+            'assert(wc:find("Remove%-Item"), "Windows async must have Remove-Item"); '
+            'assert(lc:find("&%s*$"), "Linux async must end with &"); '
+            'assert(lc:find("rm %-f"), "Linux async must have rm -f"); '
+            'assert(mc:find("&%s*$"), "macOS async must end with &"); '
+            'assert(mc:find("rm %-f"), "macOS async must have rm -f"); '
+            'print("OK_ASYNC_COMMANDS");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua async command test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_ASYNC_COMMANDS", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+    def test_quality_input_dialog_and_parsing(self):
+        """Verify custom quality dialog input parsing and boundaries via Lua."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local p = require("main"); '
+            'local r1 = p.parseQualityInput("MODE=dpi;VALUE=450"); '
+            'assert(r1.mode == "dpi" and r1.value == 450, "r1 failed"); '
+            'local r2 = p.parseQualityInput("MODE=width;VALUE=2560"); '
+            'assert(r2.mode == "width" and r2.value == 2560, "r2 failed"); '
+            'local r3 = p.parseQualityInput("600 dpi"); '
+            'assert(r3.mode == "dpi" and r3.value == 600, "r3 failed"); '
+            'local r4 = p.parseQualityInput("2560 px"); '
+            'assert(r4.mode == "width" and r4.value == 2560, "r4 failed"); '
+            'local r5 = p.parseQualityInput("width 1920"); '
+            'assert(r5.mode == "width" and r5.value == 1920, "r5 failed"); '
+            'local bLow = p.parseQualityInput("49 dpi"); '
+            'assert(bLow == nil, "49 dpi should be out of bounds"); '
+            'local bHigh = p.parseQualityInput("2401 dpi"); '
+            'assert(bHigh == nil, "2401 dpi should be out of bounds"); '
+            'local bWLow = p.parseQualityInput("99 px"); '
+            'assert(bWLow == nil, "99 px should be out of bounds"); '
+            'local bWHigh = p.parseQualityInput("10001 px"); '
+            'assert(bWHigh == nil, "10001 px should be out of bounds"); '
+            'print("OK_QUALITY_PARSER");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua quality parser test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_QUALITY_PARSER", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+    def test_decluttered_ui_menus(self):
+        """Verify that menu items are decluttered replacing 6 quality presets with 1 dialog item."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local registered = {}; '
+            '_G.app = { registerUi = function(tbl) table.insert(registered, tbl.menu) end }; '
+            'local p = require("main"); '
+            'initUi(); '
+            'assert(#registered == 2, "Must register exactly 2 menu items, got: " .. tostring(#registered)); '
+            'local hasCopy = false; local hasQuality = false; '
+            'for _, m in ipairs(registered) do '
+            '  if m:find("Copy Current Page") then hasCopy = true end '
+            '  if m:find("Quality Settings") then hasQuality = true end '
+            'end; '
+            'assert(hasCopy, "Must have Copy Current Page action"); '
+            'assert(hasQuality, "Must have Quality Settings dialog action"); '
+            'print("OK_DECLUTTERED_UI");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua decluttered UI test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_DECLUTTERED_UI", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
 
 if __name__ == "__main__":
     unittest.main()
