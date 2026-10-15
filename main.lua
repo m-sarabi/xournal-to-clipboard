@@ -26,11 +26,110 @@ CopyPagePlugin.config = {
     width = DEFAULT_CONFIG.width
 }
 
---- Determine the path for persistent configuration storage.
+--- Locate the plugin directory across platforms.
+-- Robustly resolves the directory where the CopyPageToClipboard plugin files reside.
 -- Checks:
--- 1. Environment variable COPYPAGE_CONFIG_PATH (useful for testing or overrides)
--- 2. Plugin directory (if writable)
--- 3. User config directory fallback
+-- 1. Caller stack info via debug.getinfo (checking levels 1 to 5)
+-- 2. Standard Xournal++ user plugin directories across Windows, Linux, and macOS
+-- 3. Working directory fallback (e.g. tests or standalone repo)
+-- @return string or nil plugin directory path
+function CopyPagePlugin.getPluginDir()
+    local sep = package.config:sub(1, 1)
+
+    -- 1. Try debug.getinfo up the call stack (levels 1 to 5)
+    for level = 1, 5 do
+        local info = debug.getinfo(level, "S")
+        if info and info.source and info.source:sub(1, 1) == "@" then
+            local scriptPath = info.source:sub(2)
+            local dir = scriptPath:match("^(.*)[/\\]")
+            if dir and dir ~= "" then
+                if CopyPagePlugin.fileExists(dir .. sep .. "plugin.ini") or
+                   CopyPagePlugin.fileExists(dir .. sep .. "main.lua") or
+                   CopyPagePlugin.fileExists(dir .. sep .. "config.ini") then
+                    return dir
+                end
+            end
+        end
+    end
+
+    -- 2. Check candidate Xournal++ plugin directories across platforms
+    local candidates = {}
+    local pluginFolderNames = { "CopyPageToClipboard", "xournal-to-clipboard" }
+
+    if sep == "\\" then
+        local localAppData = os.getenv("LOCALAPPDATA")
+        local appData = os.getenv("APPDATA")
+        local userProfile = os.getenv("USERPROFILE")
+
+        local baseDirs = {}
+        if localAppData and localAppData ~= "" then
+            table.insert(baseDirs, localAppData .. "\\xournalpp\\plugins")
+        end
+        if appData and appData ~= "" then
+            table.insert(baseDirs, appData .. "\\xournalpp\\plugins")
+        end
+        if userProfile and userProfile ~= "" then
+            table.insert(baseDirs, userProfile .. "\\.xournalpp\\plugins")
+        end
+
+        for _, base in ipairs(baseDirs) do
+            for _, name in ipairs(pluginFolderNames) do
+                table.insert(candidates, base .. "\\" .. name)
+            end
+        end
+    else
+        local home = os.getenv("HOME") or ""
+        local xdgConfig = os.getenv("XDG_CONFIG_HOME")
+        local baseDirs = {}
+
+        if xdgConfig and xdgConfig ~= "" then
+            table.insert(baseDirs, xdgConfig .. "/xournalpp/plugins")
+        elseif home ~= "" then
+            table.insert(baseDirs, home .. "/.config/xournalpp/plugins")
+        end
+
+        if home ~= "" then
+            table.insert(baseDirs, home .. "/.xournalpp/plugins")
+            table.insert(baseDirs, home .. "/Library/Application Support/xournalpp/plugins")
+        end
+
+        for _, base in ipairs(baseDirs) do
+            for _, name in ipairs(pluginFolderNames) do
+                table.insert(candidates, base .. "/" .. name)
+            end
+        end
+    end
+
+    -- First pass: find an existing plugin directory that contains plugin.ini or main.lua or config.ini
+    for _, dir in ipairs(candidates) do
+        if CopyPagePlugin.fileExists(dir .. sep .. "plugin.ini") or
+           CopyPagePlugin.fileExists(dir .. sep .. "main.lua") or
+           CopyPagePlugin.fileExists(dir .. sep .. "config.ini") then
+            return dir
+        end
+    end
+
+    -- Second pass: check current working directory (e.g. standalone test runs or local dev)
+    if CopyPagePlugin.fileExists("plugin.ini") or CopyPagePlugin.fileExists("main.lua") then
+        return "."
+    end
+
+    -- Third pass: default candidate plugin directory
+    if #candidates > 0 then
+        return candidates[1]
+    end
+
+    return nil
+end
+
+--- Determine the path for persistent configuration storage.
+-- Always targets 'config.ini' directly inside the plugin directory.
+-- Checks:
+-- 1. Custom config path override (CopyPagePlugin.customConfigPath)
+-- 2. Environment variable COPYPAGE_CONFIG_PATH
+-- 3. Plugin directory config.ini
+-- 4. Standard platform plugin directory config.ini
+-- @return string config file path
 function CopyPagePlugin.getConfigFilePath()
     if CopyPagePlugin.customConfigPath and CopyPagePlugin.customConfigPath ~= "" then
         return CopyPagePlugin.customConfigPath
@@ -42,47 +141,19 @@ function CopyPagePlugin.getConfigFilePath()
     end
 
     local sep = package.config:sub(1, 1)
-    local pluginDir = nil
-
-    local info = debug.getinfo(1, "S")
-    if info and info.source and info.source:sub(1, 1) == "@" then
-        local scriptPath = info.source:sub(2)
-        pluginDir = scriptPath:match("^(.*)[/\\]")
-    end
+    local pluginDir = CopyPagePlugin.getPluginDir()
 
     if pluginDir and pluginDir ~= "" then
-        local testPath = pluginDir .. sep .. "config.ini"
-        if CopyPagePlugin.fileExists(testPath) then
-            local testFile = io.open(testPath, "r+")
-            if testFile then
-                testFile:close()
-                return testPath
-            end
-        else
-            -- Check if directory is writable using a temporary probe file
-            local probePath = pluginDir .. sep .. ".copypage_probe.tmp"
-            local probeFile = io.open(probePath, "w")
-            if probeFile then
-                probeFile:close()
-                pcall(os.remove, probePath)
-                return testPath
-            end
-        end
+        return pluginDir .. sep .. "config.ini"
     end
 
-    -- Fallback to OS user configuration directories
+    -- Fallback to standard platform plugin directory
     if sep == "\\" then
-        local appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.getenv("USERPROFILE")
-        if appdata then
-            return appdata .. "\\xournalpp\\copypage_config.ini"
-        end
-        return "C:\\Temp\\copypage_config.ini"
+        local appdata = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.getenv("USERPROFILE") or "C:\\Temp"
+        return appdata .. "\\xournalpp\\plugins\\CopyPageToClipboard\\config.ini"
     else
-        local home = os.getenv("HOME")
-        if home then
-            return home .. "/.config/xournalpp/copypage_config.ini"
-        end
-        return "/tmp/copypage_config.ini"
+        local home = os.getenv("HOME") or "/tmp"
+        return home .. "/.config/xournalpp/plugins/CopyPageToClipboard/config.ini"
     end
 end
 
@@ -101,7 +172,7 @@ function CopyPagePlugin.loadConfig(filePath)
     if not file and not filePath then
         -- Check if fallback config exists in system temporary directory
         local tempDir, sep = CopyPagePlugin.getTempDir()
-        local fallbackPath = tempDir .. sep .. "copypage_config.ini"
+        local fallbackPath = tempDir .. sep .. "config.ini"
         if fallbackPath ~= targetPath then
             file = io.open(fallbackPath, "r")
         end
@@ -173,7 +244,7 @@ function CopyPagePlugin.saveConfig(filePath, configToSave)
     if not file then
         -- Last resort fallback: save to system temporary directory
         local tempDir, sep = CopyPagePlugin.getTempDir()
-        local fallbackPath = tempDir .. sep .. "copypage_config.ini"
+        local fallbackPath = tempDir .. sep .. "config.ini"
         file, err = io.open(fallbackPath, "w")
         if not file then
             return false, tostring(err)
@@ -931,7 +1002,9 @@ end
 function CopyPagePlugin.getWindowsDialogCommand(currentConfig)
     local cfg = currentConfig or CopyPagePlugin.config
     local isWidth = (cfg.mode == "width")
-    local initVal = isWidth and tostring(cfg.width or 1920) or tostring(cfg.dpi or 300)
+    local currentDpi = tostring(tonumber(cfg.dpi) or 300)
+    local currentWidth = tostring(tonumber(cfg.width) or 1920)
+    local initVal = isWidth and currentWidth or currentDpi
     local dpiChecked = isWidth and "$false" or "$true"
     local widthChecked = isWidth and "$true" or "$false"
 
@@ -939,7 +1012,7 @@ function CopyPagePlugin.getWindowsDialogCommand(currentConfig)
         'Add-Type -AssemblyName System.Windows.Forms; ' ..
         'Add-Type -AssemblyName System.Drawing; ' ..
         '$f = New-Object System.Windows.Forms.Form; ' ..
-        '$f.Text = \'Copy Quality Settings\'; ' ..
+        '$f.Text = \'Quality Settings\'; ' ..
         '$f.Size = New-Object System.Drawing.Size(320, 230); ' ..
         '$f.StartPosition = \'CenterScreen\'; ' ..
         '$f.FormBorderStyle = \'FixedDialog\'; ' ..
@@ -971,6 +1044,8 @@ function CopyPagePlugin.getWindowsDialogCommand(currentConfig)
         '$txt.Location = New-Object System.Drawing.Point(20, 95); ' ..
         '$txt.Size = New-Object System.Drawing.Size(260, 24); ' ..
         '$f.Controls.Add($txt); ' ..
+        '$rbW.add_CheckedChanged({ if ($rbW.Checked -and $txt.Text -eq \'%s\') { $txt.Text = \'%s\' } }); ' ..
+        '$rbDpi.add_CheckedChanged({ if ($rbDpi.Checked -and $txt.Text -eq \'%s\') { $txt.Text = \'%s\' } }); ' ..
         '$btnOk = New-Object System.Windows.Forms.Button; ' ..
         '$btnOk.Text = \'OK\'; ' ..
         '$btnOk.Location = New-Object System.Drawing.Point(50, 140); ' ..
@@ -989,11 +1064,11 @@ function CopyPagePlugin.getWindowsDialogCommand(currentConfig)
         '$res = $f.ShowDialog(); ' ..
         '$outStr = if ($res -eq [System.Windows.Forms.DialogResult]::OK) { ' ..
         '$m = if ($rbW.Checked) { \'width\' } else { \'dpi\' }; ' ..
-        '\"MODE=$m;VALUE=$($txt.Text.Trim())\" ' ..
+        '\'MODE=\' + $m + \';VALUE=\' + $txt.Text.Trim() ' ..
         '} else { \'CANCEL\' }; ' ..
         '$f.Dispose(); ' ..
         'Write-Output $outStr;',
-        dpiChecked, widthChecked, initVal
+        dpiChecked, widthChecked, initVal, currentDpi, currentWidth, currentWidth, currentDpi
     )
 
     return string.format(
@@ -1013,10 +1088,10 @@ function CopyPagePlugin.getLinuxDialogCommand(currentConfig)
 
     return string.format(
         'if command -v zenity >/dev/null 2>&1; then ' ..
-        'zenity --forms --title="Copy Quality Settings" --text="Configure CopyPageToClipboard Settings" ' ..
+        'zenity --forms --title="Quality Settings" --text="Configure CopyPageToClipboard Settings" ' ..
         '--add-combo="Mode" --combo-values="%s" --add-entry="Value (e.g. 300 for DPI, 1920 for Width)" 2>/dev/null; ' ..
         'elif command -v kdialog >/dev/null 2>&1; then ' ..
-        'kdialog --title "Copy Quality Settings" --inputbox "Enter Quality (e.g. 300 dpi or 1920 px):" "%s" 2>/dev/null; ' ..
+        'kdialog --title "Quality Settings" --inputbox "Enter Quality (e.g. 300 dpi or 1920 px):" "%s" 2>/dev/null; ' ..
         'else echo "CANCEL"; fi',
         comboValues, initVal
     )
@@ -1032,7 +1107,7 @@ function CopyPagePlugin.getMacDialogCommand(currentConfig)
 
     local script = string.format(
         'try\n' ..
-        '  set res to (display dialog "Enter Quality Setting (e.g. 300 dpi or 1920 px):" default answer "%s" with title "Copy Quality Settings" buttons {"Cancel", "OK"} default button "OK")\n' ..
+        '  set res to (display dialog "Enter Quality Setting (e.g. 300 dpi or 1920 px):" default answer "%s" with title "Quality Settings" buttons {"Cancel", "OK"} default button "OK")\n' ..
         '  text returned of res\n' ..
         'on error number -128\n' ..
         '  "CANCEL"\n' ..
@@ -1082,7 +1157,7 @@ function CopyPagePlugin.promptQualityDialog()
                 local initVal = isWidth and tostring(CopyPagePlugin.config.width or 1920) or tostring(CopyPagePlugin.config.dpi or 300)
 
                 local dlg = Gtk.Dialog({
-                    title = "Copy Quality Settings",
+                    title = "Quality Settings",
                     modal = true,
                     destroy_with_parent = true
                 })
@@ -1135,7 +1210,19 @@ function CopyPagePlugin.promptQualityDialog()
     local output = handle:read("*a") or ""
     handle:close()
 
-    local trimmed = output:match("^%s*(.-)%s*$")
+    local trimmed = ""
+    for line in output:gmatch("[^\r\n]+") do
+        local l = line:match("^%s*(.-)%s*$")
+        if l ~= "" then
+            if l:upper() == "CANCEL" or l:upper():match("^MODE=") then
+                trimmed = l
+                break
+            else
+                trimmed = l
+            end
+        end
+    end
+
     if trimmed == "" then
         return "CANCEL"
     end
@@ -1156,8 +1243,8 @@ function CopyPagePlugin.parseQualityInput(inputStr, defaultMode)
         return nil, "No input provided."
     end
 
-    local raw = inputStr:match("^%s*(.-)%s*$")
-    if raw == "" or raw:upper() == "CANCEL" then
+    local raw = inputStr:gsub("[\r\n]+", " "):match("^%s*(.-)%s*$")
+    if not raw or raw == "" or raw:upper() == "CANCEL" then
         return nil, "Cancelled"
     end
 
@@ -1189,6 +1276,7 @@ function CopyPagePlugin.parseQualityInput(inputStr, defaultMode)
         if m == "dpi" or m == "width" then
             mode = m
         end
+        sVal = sVal:match("^%s*(.-)%s*$")
         local sign, digits = sVal:match("([%+%-]?)%s*(%d+%.?%d*)")
         if digits and digits ~= "" then
             num = tonumber(digits)

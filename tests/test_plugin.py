@@ -380,6 +380,131 @@ class TestCopyPageToClipboard(unittest.TestCase):
             if os.path.exists(tf_path):
                 os.remove(tf_path)
 
+    def test_dialog_titles_renamed_to_quality_settings(self):
+        """Verify dialog title is 'Quality Settings' across Windows, Linux, and macOS."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local p = require("main"); '
+            'local wc = p.getWindowsDialogCommand(); '
+            'local lc = p.getLinuxDialogCommand(); '
+            'local mc = p.getMacDialogCommand(); '
+            'assert(wc:find("%$f%.Text = \'Quality Settings\'") ~= nil, "Windows title must be Quality Settings"); '
+            'assert(wc:find("Copy Quality Settings") == nil, "Windows title must not contain Copy Quality Settings"); '
+            'assert(lc:find(\'title="Quality Settings"\') ~= nil, "Linux zenity title must be Quality Settings"); '
+            'assert(lc:find(\'title "Quality Settings"\') ~= nil, "Linux kdialog title must be Quality Settings"); '
+            'assert(lc:find("Copy Quality Settings") == nil, "Linux title must not contain Copy Quality Settings"); '
+            'assert(mc:find(\'with title "Quality Settings"\') ~= nil, "macOS title must be Quality Settings"); '
+            'assert(mc:find("Copy Quality Settings") == nil, "macOS title must not contain Copy Quality Settings"); '
+            'print("OK_DIALOG_TITLES");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua dialog title test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_DIALOG_TITLES", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+    def test_config_path_resolution_and_plugin_dir(self):
+        """Verify getConfigFilePath targets config.ini in plugin dir and handles relative source."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local p = require("main"); '
+            'local path1 = p.getConfigFilePath(); '
+            'assert(path1:match("config%.ini$") ~= nil, "Path must end with config.ini: " .. tostring(path1)); '
+            'assert(path1:find("copypage_config%.ini") == nil, "Path must not be copypage_config.ini"); '
+            'local orig = debug.getinfo; '
+            'debug.getinfo = function(l, w) if w == "S" then return { source = "@main.lua" } end return orig(l, w) end; '
+            'local path2 = p.getConfigFilePath(); '
+            'assert(path2:match("config%.ini$") ~= nil, "Fallback path must end with config.ini: " .. tostring(path2)); '
+            'assert(path2:find("copypage_config%.ini") == nil, "Fallback path must not be copypage_config.ini"); '
+            'debug.getinfo = orig; '
+            'print("OK_CONFIG_PATH");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua config path test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_CONFIG_PATH", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+    def test_end_to_end_width_1000_save_and_export(self):
+        """Verify end-to-end setting save and export with Width=1000."""
+        import tempfile
+        lua_code = (
+            'package.path = "./?.lua;" .. package.path; '
+            'local p = require("main"); '
+            'local tempDir = p.getTempDir(); '
+            'local sep = package.config:sub(1, 1); '
+            'local testPath = tempDir .. sep .. "test_py_width1000.ini"; '
+            'p.customConfigPath = testPath; '
+            'local parsed, err = p.parseQualityInput("\\r\\nMODE=width;VALUE=1000\\r\\n"); '
+            'assert(parsed ~= nil and parsed.mode == "width" and parsed.value == 1000, "parsing failed: " .. tostring(err)); '
+            'local saveOk, saveMsg = p.applyQualitySettings(parsed.mode, parsed.value); '
+            'assert(saveOk, "applyQualitySettings failed: " .. tostring(saveMsg)); '
+            'assert(p.config.mode == "width", "active mode must be width"); '
+            'assert(p.config.width == 1000, "active width must be 1000"); '
+            'local reloaded = p.loadConfig(testPath); '
+            'assert(reloaded.mode == "width", "reloaded mode must be width"); '
+            'assert(reloaded.width == 1000, "reloaded width must be 1000"); '
+            'local captured = nil; '
+            '_G.app = { export = function(params) captured = params; local f = io.open(params.outputFile, "wb"); f:write("dummy"); f:close() end }; '
+            'local targetPng = tempDir .. sep .. "test_py_export.png"; '
+            'local expFile, expErr = p.exportPage(1, targetPng, { currentPage = 1, pages = { { pageWidth = 595.28 } } }); '
+            'assert(expFile ~= nil, "exportPage failed: " .. tostring(expErr)); '
+            'assert(captured.pngWidth == 1000, "exported pngWidth must be 1000"); '
+            'assert(captured.pngDpi == 121, "exported pngDpi must be 121"); '
+            'os.remove(testPath); os.remove(targetPng); '
+            'p.customConfigPath = nil; p.config.mode = "dpi"; p.config.dpi = 300; p.config.width = 1920; '
+            'print("OK_END_TO_END_WIDTH_1000");\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", encoding="utf-8", delete=False) as tf:
+            tf.write(lua_code)
+            tf_path = tf.name
+
+        try:
+            res = subprocess.run(
+                ["texlua", "--luaonly", tf_path],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=10
+            )
+            self.assertEqual(res.returncode, 0, f"Lua end-to-end test failed:\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+            self.assertIn("OK_END_TO_END_WIDTH_1000", res.stdout)
+        except FileNotFoundError:
+            self.skipTest("texlua interpreter not found")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
 
 if __name__ == "__main__":
     unittest.main()

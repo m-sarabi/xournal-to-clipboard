@@ -652,7 +652,7 @@ local winDlgCmd = plugin.getWindowsDialogCommand()
 assert_true(winDlgCmd:find("powershell%.exe"), "Windows dialog command must invoke powershell")
 assert_true(winDlgCmd:find("%-WindowStyle Hidden"), "Windows dialog command must use WindowStyle Hidden to avoid console window flash")
 assert_true(winDlgCmd:find("System%.Windows%.Forms"), "Windows dialog command must load System.Windows.Forms")
-assert_true(winDlgCmd:find("Copy Quality Settings"), "Windows dialog command must set title")
+assert_true(winDlgCmd:find("Quality Settings"), "Windows dialog command must set title")
 assert_true(winDlgCmd:find("RadioButton"), "Windows dialog command must include RadioButtons")
 assert_true(winDlgCmd:find("TextBox"), "Windows dialog command must include TextBox")
 assert_true(winDlgCmd:find("%$f%.Dispose%(%)"), "Windows dialog command must dispose Form on exit")
@@ -669,6 +669,105 @@ local osDlgCmd = plugin.getDialogCommand()
 assert_true(osDlgCmd ~= nil and #osDlgCmd > 0, "getDialogCommand must return non-empty command")
 
 print("  PASSED: Quality Settings dialog, input parsing, boundaries, and persistence verified.")
+
+--------------------------------------------------------------------------------
+-- 9. Regression Tests for Settings Persistence, Dialog Title, and Plugin Dir
+--------------------------------------------------------------------------------
+print("\n[Test 9] Verifying fixes for settings saving, dialog title, and plugin directory...")
+
+-- 9a. Verify Dialog Title across all platforms
+assert_true(winDlgCmd:find("%$f%.Text = 'Quality Settings'") ~= nil, "WinForms dialog title must be 'Quality Settings'")
+assert_true(winDlgCmd:find("Copy Quality Settings") == nil, "WinForms dialog title must not contain 'Copy Quality Settings'")
+assert_true(linuxDlgCmd:find('%-%-title="Quality Settings"') ~= nil, "Zenity dialog title must be 'Quality Settings'")
+assert_true(linuxDlgCmd:find('%-%-title "Quality Settings"') ~= nil, "Kdialog dialog title must be 'Quality Settings'")
+assert_true(linuxDlgCmd:find("Copy Quality Settings") == nil, "Linux dialog must not contain 'Copy Quality Settings'")
+assert_true(macDlgCmd:find('with title "Quality Settings"') ~= nil, "macOS dialog title must be 'Quality Settings'")
+assert_true(macDlgCmd:find("Copy Quality Settings") == nil, "macOS dialog must not contain 'Copy Quality Settings'")
+
+-- 9b. Verify getConfigFilePath() targets config.ini directly in plugin directory
+local cfgPath = plugin.getConfigFilePath()
+assert_true(cfgPath:match("config%.ini$") ~= nil, "Config path must end with 'config.ini'")
+assert_true(cfgPath:find("copypage_config%.ini") == nil, "Config path must not be copypage_config.ini")
+
+-- Verify plugin directory resolution when debug.getinfo is unreliable (@main.lua without dir)
+local origGetInfo = debug.getinfo
+debug.getinfo = function(level, what)
+    if what == "S" then
+        return { source = "@main.lua" }
+    end
+    return origGetInfo(level, what)
+end
+local fallbackCfgPath = plugin.getConfigFilePath()
+assert_true(fallbackCfgPath:match("config%.ini$") ~= nil, "Fallback config path must end with config.ini")
+assert_true(fallbackCfgPath:find("copypage_config%.ini") == nil, "Fallback config path must not be copypage_config.ini")
+debug.getinfo = origGetInfo
+
+-- 9c. Verify CRLF trimming and multi-line parsing resilience
+local crlfParsed, crlfErr = plugin.parseQualityInput("\r\nMODE=width;VALUE=1000\r\n")
+assert_true(crlfParsed ~= nil, "CRLF input must be parsed successfully")
+assert_eq(crlfParsed.mode, "width", "Parsed mode with CRLF must be 'width'")
+assert_eq(crlfParsed.value, 1000, "Parsed value with CRLF must be 1000")
+
+local crlfTrailing, _ = plugin.parseQualityInput("MODE=width;VALUE=1000\r")
+assert_true(crlfTrailing ~= nil and crlfTrailing.value == 1000, "Trailing CR must be stripped and parsed as 1000")
+
+-- 9d. WinForms dialog command execution via popen (mocking OK response)
+if plugin.detectOS() == "windows" then
+    local mockCmd = winDlgCmd:gsub("%$res = %$f%.ShowDialog%(%);", "$rbW.Checked = $true; $txt.Text = '1000'; $res = [System.Windows.Forms.DialogResult]::OK;")
+    local handle = io.popen(mockCmd)
+    assert_true(handle ~= nil, "io.popen should execute the Windows dialog command")
+    local popenOut = handle:read("*a") or ""
+    local popenOk, _, popenCode = handle:close()
+    assert_true(popenOk, "PowerShell dialog command must exit successfully")
+    assert_true(popenOut:find("MODE=width;VALUE=1000") ~= nil, "Command output must contain 'MODE=width;VALUE=1000'")
+    assert_true(popenOut:find("CommandNotFoundException") == nil, "Command output must not contain parser or command errors")
+
+    local parsedCmdOut, pErr = plugin.parseQualityInput(popenOut)
+    assert_true(parsedCmdOut ~= nil, "Parsed command output must succeed: " .. tostring(pErr))
+    assert_eq(parsedCmdOut.mode, "width", "Command output mode must be 'width'")
+    assert_eq(parsedCmdOut.value, 1000, "Command output value must be 1000")
+end
+
+-- 9e. End-to-end setting save and exportPage verification (Width = 1000)
+local testSavedConfigPath = tempDir .. sep .. "test_save_width_1000_" .. tostring(os.time()) .. ".ini"
+plugin.customConfigPath = testSavedConfigPath
+
+local appOk, appMsg = plugin.applyQualitySettings("width", 1000)
+assert_true(appOk, "applyQualitySettings should succeed: " .. tostring(appMsg))
+assert_eq(plugin.config.mode, "width", "Active mode must be 'width'")
+assert_eq(plugin.config.width, 1000, "Active width must be 1000")
+
+local reloaded1000 = plugin.loadConfig(testSavedConfigPath)
+assert_eq(reloaded1000.mode, "width", "Persisted mode in config.ini must be 'width'")
+assert_eq(reloaded1000.width, 1000, "Persisted width in config.ini must be 1000")
+
+-- Verify exportPage uses width = 1000 instead of default DPI 300
+local capturedExportParams = nil
+_G.app.export = function(params)
+    capturedExportParams = params
+    -- Create dummy output file so findExportedPngFileWithRetry finds it
+    local fp = io.open(params.outputFile, "wb")
+    fp:write("dummy png")
+    fp:close()
+end
+
+local testExportTarget = tempDir .. sep .. "test_export_width_1000.png"
+local expFile, expErr = plugin.exportPage(1, testExportTarget, { currentPage = 1, pages = { { pageWidth = 595.28 } } })
+assert_true(expFile ~= nil, "exportPage should succeed: " .. tostring(expErr))
+assert_true(capturedExportParams ~= nil, "app.export must be called")
+assert_eq(capturedExportParams.pngWidth, 1000, "exportParams pngWidth must be 1000")
+-- 1000 * 72 / 595.28 ≈ 121 DPI
+assert_eq(capturedExportParams.pngDpi, 121, "exportParams pngDpi must be calculated DPI (121), not default 300")
+
+-- Clean up
+os.remove(testSavedConfigPath)
+os.remove(testExportTarget)
+plugin.customConfigPath = nil
+plugin.config.mode = "dpi"
+plugin.config.dpi = 300
+plugin.config.width = 1920
+
+print("  PASSED: Regression tests for settings saving, dialog title, and plugin directory verified.")
 
 print("\n======================================================================")
 print(string.format("All tests completed: %d assertions passed, %d failed.", testsPassed, testsFailed))
